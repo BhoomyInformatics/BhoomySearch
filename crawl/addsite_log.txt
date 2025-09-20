@@ -1,0 +1,99 @@
+=== AddSite Log Started at 2025-09-04T04:07:10.184Z ===
+[2025-09-04T04:07:10.186Z] Starting URL processing
+[2025-09-04T04:07:10.240Z] Database initialized successfully
+[2025-09-04T04:07:10.241Z] Reading URLs from addurls.txt
+[2025-09-04T04:07:10.246Z] Read 82 URLs from file
+[2025-09-04T04:07:10.247Z] Split URLs into 1 batches of up to 2000 URLs each
+[2025-09-04T04:07:10.247Z] Starting parallel processing with max 47 concurrent batches
+[2025-09-04T04:07:10.249Z] Processing batch #1 with 82 URLs
+[2025-09-04T04:07:10.257Z] Duplicate entry. URL not inserted: https://rsmdp.in/
+[2025-09-04T04:07:10.258Z] Duplicate entry. URL not inserted: https://www.mappls.com/
+[2025-09-04T04:07:10.260Z] Duplicate entry. URL not inserted: https://asccrahuri.ac.in/
+[2025-09-04T04:07:10.261Z] Duplicate entry. URL not inserted: https://www.tenderdetail.com/
+[2025-09-04T04:07:10.263Z] Duplicate entry. URL not inserted: https://www.census2011.co.in/
+[2025-09-04T04:07:10.264Z] Duplicate entry. URL not inserted: https://morningstartrust.org/
+[2025-09-04T04:07:10.265Z] Duplicate entry. URL not inserted: https://www.casemine.com/
+[2025-09-04T04:07:10.267Z] Duplicate entry. URL not inserted: https://www.rome2rio.com/
+[2025-09-04T04:07:10.268Z] Duplicate entry. URL not inserted: https://mahaulb.in/
+[2025-09-04T04:07:10.270Z] Duplicate entry. URL not inserted: https://www.mpcb.gov.in/
+[2025-09-04T04:07:10.271Z] Duplicate entry. URL not inserted: https://nmc.gov.in/
+[2025-09-04T04:07:10.271Z] Duplicate entry. URL not inserted: https://mohua.gov.in/
+[2025-09-04T04:07:10.273Z] Duplicate entry. URL not inserted: https://www.govnokri.in/
+[2025-09-04T04:07:10.274Z] Duplicate entry. URL not inserted: https://www.onefivenine.com/
+[2025-09-04T04:07:10.274Z] Duplicate entry. URL not inserted: https://www.zaubacorp.com/
+[2025-09-04T04:07:10.276Z] Duplicate entry. URL not inserted: https://www.iobnet.co.in/
+[2025-09-04T04:07:10.277Z] Duplicate entry. URL not inserted: https://iibf.esdsconnect.com/
+[2025-09-04T04:07:10.277Z] Duplicate entry. URL not inserted: https://www.lmc.org.in/
+[2025-09-04T04:07:10.278Z] Duplicate entry. URL not inserted: https://findmygov.in/
+[2025-09-04T04:07:10.284Z] URL inserted successfully: Cinetown (https://cinetown.org/)
+[2025-09-04T04:07:10.287Z] URL inserted successfully: Cherryautomations (https://www.cherryautomations.com/)
+[2025-09-04T04:07:10.289Z] URL inserted successfully: Ivoltaa (https://www.ivoltaa.com/)
+[2025-09-04T04:07:10.291Z] URL inserted successfully: Vtu (https://vtu.ac.in/)
+[2025-09-04T04:07:10.297Z] URL inserted successfully: Shiksha (https://www.shiksha.com/)
+[2025-09-04T04:07:10.299Z] URL inserted successfully: Topuniversities (https://www.topuniversities.com/)
+[2025-09-04T04:07:10.301Z] URL inserted successfully: Testbook (https://testbook.com/)
+[2025-09-04T04:07:10.303Z] URL inserted successfully: Timeshighereducation (https://www.timeshighereducation.com/)
+[2025-09-04T04:07:10.305Z] URL inserted successfully: Selectyouruniversity (https://www.selectyouruniversity.com/)
+[2025-09-04T04:07:10.307Z] URL inserted successfully: Collegeindia (https://www.collegeindia.in/)
+[2025-09-04T04:07:10.309Z] URL inserted successfully: Vtu-online (https://www.vtu-online.net/)
+[2025-09-04T04:07:10.311Z] URL inserted successfully: Universityinnovation (https://universityinnovation.org/)
+[2025-09-04T04:07:10.313Z] URL inserted successfully: Allegiance-educare (https://allegiance-educare.in/)
+[2025-09-04T04:07:10.315Z] URL inserted successfully: Aajtakcampus (https://www.aajtakcampus.in/)
+[2025-09-04T04:07:10.317Z] URL inserted successfully: Nature (https://www.nature.com/)
+[2025-09-04T04:07:10.319Z] URL inserted successfully: Sirmvit (https://www.sirmvit.edu/)
+[2025-09-04T04:07:10.321Z] URL inserted successfully: Collegedunia (https://collegedunia.com/)
+[2025-09-04T04:07:10.322Z] URL inserted successfully: Vidyalive (https://www.vidyalive.com/)
+[2025-09-04T04:07:10.324Z] URL inserted successfully: Collegevidya (https://collegevidya.com/)
+[2025-09-04T04:07:10.326Z] URL inserted successfully: Educatly (https://www.educatly.com/)
+[2025-09-04T04:07:10.328Z] URL inserted successfully: Veltech (https://www.veltech.edu.in/)
+[2025-09-04T04:07:10.330Z] URL inserted successfully: Newhorizoncollegeofengineering (https://newhorizoncollegeofengineering.in/)
+[2025-09-04T04:07:10.332Z] URL inserted successfully: Free-apply (https://free-apply.com/)
+[2025-09-04T04:07:10.334Z] URL inserted successfully: Unilist (https://www.unilist.in/)
+[2025-09-04T04:07:10.336Z] URL inserted successfully: Edarabia (https://www.edarabia.com/)
+[2025-09-04T04:07:10.338Z] URL inserted successfully: Developmentaid (https://www.developmentaid.org/)
+[2025-09-04T04:07:10.340Z] URL inserted successfully: Wikiwand (https://www.wikiwand.com/)
+[2025-09-04T04:07:10.341Z] URL inserted successfully: Universityfindo (https://universityfindo.com/)
+[2025-09-04T04:07:10.343Z] URL inserted successfully: Dsce (https://www.dsce.edu.in/)
+[2025-09-04T04:07:10.344Z] Duplicate entry. URL not inserted: https://universityfindo.com/
+[2025-09-04T04:07:10.346Z] URL inserted successfully: Vtustudent (https://vtustudent.com/)
+[2025-09-04T04:07:10.348Z] URL inserted successfully: Rrce (https://www.rrce.org/)
+[2025-09-04T04:07:10.350Z] URL inserted successfully: Vtu (https://www.vtu.co.in/)
+[2025-09-04T04:07:10.352Z] URL inserted successfully: Aston (https://www.aston.ac.uk/)
+[2025-09-04T04:07:10.354Z] URL inserted successfully: Admissiontarget (https://www.admissiontarget.com/)
+[2025-09-04T04:07:10.356Z] URL inserted successfully: Shaalaa (https://www.shaalaa.com/)
+[2025-09-04T04:07:10.358Z] URL inserted successfully: Bnmit (https://www.bnmit.org/)
+[2025-09-04T04:07:10.359Z] URL inserted successfully: Cetonline (https://cetonline.karnataka.gov.in/)
+[2025-09-04T04:07:10.362Z] URL inserted successfully: Saividya (https://saividya.ac.in/)
+[2025-09-04T04:07:10.363Z] URL inserted successfully: Targetstudy (https://targetstudy.com/)
+[2025-09-04T04:07:10.365Z] URL inserted successfully: Cmrit (https://www.cmrit.ac.in/)
+[2025-09-04T04:07:10.367Z] URL inserted successfully: Rnsit (https://www.rnsit.ac.in/)
+[2025-09-04T04:07:10.369Z] URL inserted successfully: Snpsu (https://snpsu.edu.in/)
+[2025-09-04T04:07:10.371Z] URL inserted successfully: Bmsit (https://bmsit.ac.in/)
+[2025-09-04T04:07:10.373Z] URL inserted successfully: Nirfindia (https://www.nirfindia.org/)
+[2025-09-04T04:07:10.375Z] URL inserted successfully: Pesce (https://pesce.ac.in/)
+[2025-09-04T04:07:10.377Z] URL inserted successfully: Allaboutbelgaum (https://allaboutbelgaum.com/)
+[2025-09-04T04:07:10.379Z] URL inserted successfully: Newartscollege (https://newartscollege.ac.in/)
+[2025-09-04T04:07:10.381Z] URL inserted successfully: Aca (https://www.aca.edu.in/)
+[2025-09-04T04:07:10.384Z] URL inserted successfully: Gpnagar (http://gpnagar.ac.in/)
+[2025-09-04T04:07:10.386Z] URL inserted successfully: Enggnagar (https://enggnagar.com/)
+[2025-09-04T04:07:10.388Z] URL inserted successfully: Sanjivanicoe (http://www.sanjivanicoe.org.in/)
+[2025-09-04T04:07:10.390Z] URL inserted successfully: Avcoe (https://www.avcoe.org/)
+[2025-09-04T04:07:10.391Z] URL inserted successfully: Pravaraengg (http://www.pravaraengg.org.in/)
+[2025-09-04T04:07:10.393Z] URL inserted successfully: Newartsparner (https://newartsparner.com/)
+[2025-09-04T04:07:10.396Z] URL inserted successfully: Newlawcollege (https://newlawcollege.org/)
+[2025-09-04T04:07:10.398Z] URL inserted successfully: Imscdr (https://www.imscdr.ac.in/)
+[2025-09-04T04:07:10.400Z] URL inserted successfully: Ahmednagarhomoeopathicmedicalcollege (https://www.ahmednagarhomoeopathicmedicalcollege.org/)
+[2025-09-04T04:07:10.401Z] URL inserted successfully: Vimsmch (https://vimsmch.edu.in/)
+[2025-09-04T04:07:10.403Z] URL inserted successfully: Nacscs (https://nacscs.ac.in/)
+[2025-09-04T04:07:10.405Z] URL inserted successfully: Ascrahata (https://www.ascrahata.org/)
+[2025-09-04T04:07:10.407Z] URL inserted successfully: Kgcollege (https://kgcollege.in/)
+[2025-09-04T04:07:10.409Z] URL inserted successfully: Svnhtrahuri (https://www.svnhtrahuri.org/)
+[2025-09-04T04:07:10.410Z] Batch #1: Successfully inserted 62 URLs
+[2025-09-04T04:07:10.410Z] Progress: 1/1 batches (100.00%), 62 URLs inserted so far
+[2025-09-04T04:07:10.410Z] =============== SUMMARY ===============
+[2025-09-04T04:07:10.410Z] Total URLs processed: 82
+[2025-09-04T04:07:10.410Z] Total URLs inserted: 62
+[2025-09-04T04:07:10.411Z] Duplicates skipped: 20
+[2025-09-04T04:07:10.411Z] Time taken: 0.23 seconds
+[2025-09-04T04:07:10.411Z] Average rate: 274.34 URLs/second
+[2025-09-04T04:07:10.411Z] =======================================

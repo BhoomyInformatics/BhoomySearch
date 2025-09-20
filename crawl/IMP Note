@@ -1,0 +1,12 @@
+site search in DB
+SELECT * FROM sites WHERE site_url LIKE '%loti.com%' LIMIT 0, 25;
+
+
+ALTER TABLE sites ADD COLUMN locked_by VARCHAR(16) NULL;
+
+
+(if create new DB " ALTER TABLE site ADD site_locked BOOLEAN DEFAULT FALSE; "  for site lock)
+
+
+ALTER TABLE site_videos MODIFY COLUMN site_videos_alt VARCHAR(255) NOT NULL DEFAULT '';
+ALTER TABLE site_videos MODIFY COLUMN site_videos_poster VARCHAR(255) NOT NULL DEFAULT '';

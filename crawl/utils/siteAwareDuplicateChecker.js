@@ -1,0 +1,798 @@
+const crypto = require('crypto');
+const { logger } = require('./logger');
+const { duplicateChecker } = require('./duplicateChecker');
+const { EnhancedDuplicateManager } = require('./enhanced-duplicate-manager');
+
+/**
+ * Site-Aware Duplicate Checker
+ * Enhanced version with advanced content-based duplicate detection, similarity analysis,
+ * and smart URL filtering to maximize crawling efficiency
+ */
+class SiteAwareDuplicateChecker {
+    constructor(dbConnection, options = {}) {
+        this.dbConnection = dbConnection;
+        this.options = {
+            maxCacheSize: 50000,
+            batchSize: 500,
+            enableContentHashing: true,
+            enableAdvancedDuplication: true,
+            enableSimilarityDetection: true,
+            enableContentMerging: true,
+            similarityThreshold: 0.85,
+            ...options
+        };
+        
+        // Site-specific caches
+        this.siteCaches = new Map(); // siteId -> { crawledUrls, urlHashes, contentHashes, contentFingerprints, stats }
+        this.currentSiteId = null;
+        this.currentSiteStats = null;
+        
+        // Enhanced duplicate management
+        this.enhancedDuplicateManager = new EnhancedDuplicateManager(dbConnection, {
+            maxCacheSize: this.options.maxCacheSize,
+            similarityThreshold: this.options.similarityThreshold,
+            enableSimilarityDetection: this.options.enableSimilarityDetection,
+            enableContentMerging: this.options.enableContentMerging
+        });
+        
+        // Global statistics (enhanced)
+        this.globalStats = {
+            sitesInitialized: 0,
+            totalUrlsChecked: 0,
+            duplicatesSkipped: 0,
+            newUrlsFound: 0,
+            httpRequestsSaved: 0,
+            contentAnalyzed: 0,
+            similarContentDetected: 0,
+            contentClustersCreated: 0,
+            contentMerged: 0
+        };
+        
+        logger.info('Enhanced SiteAwareDuplicateChecker initialized', {
+            service: 'SiteAwareDuplicateChecker',
+            options: this.options,
+            hasDbConnection: !!this.dbConnection,
+            enhancedFeatures: {
+                contentBasedDeduplication: this.options.enableAdvancedDuplication,
+                similarityDetection: this.options.enableSimilarityDetection,
+                contentMerging: this.options.enableContentMerging
+            }
+        });
+    }
+
+    /**
+     * Initialize duplicate checker for a specific site
+     * Loads existing crawled URLs and provides site statistics
+     */
+    async initializeForSite(siteId, siteUrl = null) {
+        try {
+            this.currentSiteId = siteId;
+            
+            // Skip if already initialized for this site
+            if (this.siteCaches.has(siteId)) {
+                this.currentSiteStats = this.siteCaches.get(siteId).stats;
+                logger.info('Site already initialized, using cached data', {
+                    siteId,
+                    cachedUrls: this.currentSiteStats.totalCrawledUrls
+                });
+                return this.currentSiteStats;
+            }
+            
+            // Initialize site cache with enhanced features
+            const siteCache = {
+                crawledUrls: new Set(),
+                urlHashes: new Set(),
+                contentHashes: new Set(),
+                contentFingerprints: new Map(), // contentHash -> fingerprint data
+                stats: {
+                    siteId,
+                    siteUrl,
+                    totalCrawledUrls: 0,
+                    uniqueContentHashes: 0,
+                    similarContentGroups: 0,
+                    contentClusters: 0,
+                    duplicatesDetected: 0,
+                    lastCrawlDate: null,
+                    urlsAddedToday: 0,
+                    avgDailyUrls: 0,
+                    estimatedNewUrls: 0,
+                    crawlPriority: 'normal' // low, normal, high
+                }
+            };
+            
+            if (!this.dbConnection) {
+                logger.warn('No database connection, using memory-only mode', { siteId });
+                this.siteCaches.set(siteId, siteCache);
+                this.currentSiteStats = siteCache.stats;
+                return this.currentSiteStats;
+            }
+            
+            // Load site statistics and existing URLs
+            await this.loadSiteStatistics(siteId, siteCache);
+            await this.loadSiteCrawledUrls(siteId, siteCache);
+            
+            // Calculate crawl priority and estimated new URLs
+            this.calculateSitePriority(siteCache);
+            
+            this.siteCaches.set(siteId, siteCache);
+            this.currentSiteStats = siteCache.stats;
+            this.globalStats.sitesInitialized++;
+            
+            logger.info('Site initialized successfully', {
+                siteId,
+                siteUrl,
+                totalCrawledUrls: siteCache.stats.totalCrawledUrls,
+                urlsAddedToday: siteCache.stats.urlsAddedToday,
+                crawlPriority: siteCache.stats.crawlPriority,
+                estimatedNewUrls: siteCache.stats.estimatedNewUrls
+            });
+            
+            return this.currentSiteStats;
+            
+        } catch (error) {
+            logger.error('Error initializing site for duplicate checking', {
+                siteId,
+                siteUrl,
+                error: error.message
+            });
+            throw error;
+        }
+    }
+    
+    /**
+     * Load comprehensive site statistics from database
+     */
+    async loadSiteStatistics(siteId, siteCache) {
+        try {
+            // Get basic site statistics
+            const statsQuery = `
+                SELECT 
+                    COUNT(*) as total_crawled_urls,
+                    COUNT(DISTINCT content_hash) as unique_content_hashes,
+                    MAX(crawl_date) as last_crawl_date,
+                    COUNT(CASE WHEN DATE(crawl_date) = CURDATE() THEN 1 END) as urls_added_today,
+                    AVG(daily_count) as avg_daily_urls
+                FROM (
+                    SELECT 
+                        content_hash,
+                        crawl_date,
+                        COUNT(*) as daily_count
+                    FROM site_data 
+                    WHERE site_data_site_id = ?
+                    GROUP BY DATE(crawl_date)
+                ) as daily_stats
+            `;
+            
+            const statsResult = await this.executeQuery(statsQuery, [siteId]);
+            
+            if (statsResult && statsResult.length > 0) {
+                const stats = statsResult[0];
+                siteCache.stats.totalCrawledUrls = parseInt(stats.total_crawled_urls) || 0;
+                siteCache.stats.uniqueContentHashes = parseInt(stats.unique_content_hashes) || 0;
+                siteCache.stats.lastCrawlDate = stats.last_crawl_date;
+                siteCache.stats.urlsAddedToday = parseInt(stats.urls_added_today) || 0;
+                siteCache.stats.avgDailyUrls = parseFloat(stats.avg_daily_urls) || 0;
+            }
+            
+        } catch (error) {
+            logger.error('Error loading site statistics', {
+                siteId,
+                error: error.message
+            });
+            // Continue with default values
+        }
+    }
+    
+    /**
+     * Load existing crawled URLs for the site into memory cache
+     */
+    async loadSiteCrawledUrls(siteId, siteCache) {
+        try {
+            const urlsQuery = `
+                SELECT 
+                    site_data_url_hash,
+                    site_data_link,
+                    content_hash
+                FROM site_data 
+                WHERE site_data_site_id = ? 
+                    AND site_data_url_hash IS NOT NULL
+                ORDER BY site_data_id DESC
+                LIMIT ?
+            `;
+            
+            const limit = this.options.maxCacheSize;
+            const urlResults = await this.executeQuery(urlsQuery, [siteId, limit]);
+            
+            if (urlResults && urlResults.length > 0) {
+                urlResults.forEach(row => {
+                    if (row.site_data_url_hash) {
+                        siteCache.urlHashes.add(row.site_data_url_hash);
+                        siteCache.crawledUrls.add(row.site_data_link);
+                        
+                        if (row.content_hash) {
+                            siteCache.contentHashes.add(row.content_hash);
+                        }
+                    }
+                });
+            }
+            
+            logger.debug('Loaded site URLs into cache', {
+                siteId,
+                urlsLoaded: urlResults ? urlResults.length : 0,
+                cacheSize: siteCache.urlHashes.size
+            });
+            
+        } catch (error) {
+            logger.error('Error loading site crawled URLs', {
+                siteId,
+                error: error.message
+            });
+            // Continue with empty cache
+        }
+    }
+    
+    /**
+     * Calculate site crawling priority based on statistics
+     */
+    calculateSitePriority(siteCache) {
+        const stats = siteCache.stats;
+        
+        // Calculate days since last crawl
+        const daysSinceLastCrawl = stats.lastCrawlDate ? 
+            Math.floor((new Date() - new Date(stats.lastCrawlDate)) / (1000 * 60 * 60 * 24)) : 999;
+        
+        // Estimate potential new URLs
+        let estimatedNewUrls = 0;
+        if (stats.avgDailyUrls > 0 && daysSinceLastCrawl > 0) {
+            estimatedNewUrls = Math.floor(stats.avgDailyUrls * daysSinceLastCrawl);
+        }
+        
+        // Determine priority
+        if (stats.totalCrawledUrls === 0) {
+            stats.crawlPriority = 'high'; // New site
+            stats.estimatedNewUrls = 1000; // Assume many new URLs
+        } else if (daysSinceLastCrawl > 7 && stats.avgDailyUrls > 10) {
+            stats.crawlPriority = 'high'; // Active site, not crawled recently
+            stats.estimatedNewUrls = estimatedNewUrls;
+        } else if (daysSinceLastCrawl > 3 && stats.avgDailyUrls > 5) {
+            stats.crawlPriority = 'normal'; // Moderately active
+            stats.estimatedNewUrls = estimatedNewUrls;
+        } else if (stats.totalCrawledUrls > 1000 && daysSinceLastCrawl <= 1) {
+            stats.crawlPriority = 'low'; // Large site crawled recently
+            stats.estimatedNewUrls = Math.min(estimatedNewUrls, 50);
+        } else {
+            stats.crawlPriority = 'normal';
+            stats.estimatedNewUrls = estimatedNewUrls;
+        }
+    }
+    
+    /**
+     * Filter URLs to find only new/uncrawled ones
+     * This is the key method that solves your problem
+     */
+    async findNewUrls(urls, siteId = null, options = {}) {
+        if (!Array.isArray(urls) || urls.length === 0) {
+            return [];
+        }
+        
+        const targetSiteId = siteId || this.currentSiteId;
+        if (!targetSiteId) {
+            logger.warn('No site ID available for URL filtering');
+            return urls; // Return all URLs if no site context
+        }
+        
+        // Initialize site if not already done
+        if (!this.siteCaches.has(targetSiteId)) {
+            await this.initializeForSite(targetSiteId);
+        }
+        
+        const siteCache = this.siteCaches.get(targetSiteId);
+        const newUrls = [];
+        const duplicateUrls = [];
+        
+        // Check if this is a force crawl (for news sites)
+        const isForceCrawl = options.forceCrawl || options.skipRecentCheck || options.crawlInterval === 'daily';
+        
+        // Filter URLs using site-specific cache
+        for (const url of urls) {
+            try {
+                const normalizedUrl = this.normalizeUrl(url);
+                const urlHash = this.hashUrl(normalizedUrl);
+                
+                // For force crawl (news sites), include all URLs regardless of previous crawling
+                if (isForceCrawl) {
+                    newUrls.push(url);
+                    this.globalStats.newUrlsFound++;
+                    continue;
+                }
+                
+                // Check site-specific cache first (normal behavior for non-news sites)
+                if (siteCache.urlHashes.has(urlHash)) {
+                    duplicateUrls.push(url);
+                    this.globalStats.duplicatesSkipped++;
+                    continue;
+                }
+                
+                newUrls.push(url);
+                this.globalStats.newUrlsFound++;
+                
+            } catch (error) {
+                logger.warn('Error processing URL in filter', {
+                    url,
+                    error: error.message
+                });
+                newUrls.push(url); // Include problematic URLs for safety
+            }
+        }
+        
+        this.globalStats.totalUrlsChecked += urls.length;
+        this.globalStats.httpRequestsSaved += duplicateUrls.length;
+        
+        logger.info('URL filtering completed', {
+            siteId: targetSiteId,
+            totalUrls: urls.length,
+            newUrls: newUrls.length,
+            duplicatesSkipped: duplicateUrls.length,
+            efficiency: Math.round((duplicateUrls.length / urls.length) * 100),
+            forceCrawl: isForceCrawl
+        });
+        
+        return newUrls;
+    }
+    
+    /**
+     * Check if a single URL is already crawled for the site
+     */
+    async isUrlAlreadyCrawled(url, siteId = null, options = {}) {
+        const targetSiteId = siteId || this.currentSiteId;
+        if (!targetSiteId) {
+            return false;
+        }
+        
+        // Check if this is a force crawl (for news sites)
+        const isForceCrawl = options.forceCrawl || options.skipRecentCheck || options.crawlInterval === 'daily';
+        if (isForceCrawl) {
+            return false; // Force crawl means we want to crawl everything
+        }
+        
+        // Initialize site if not already done
+        if (!this.siteCaches.has(targetSiteId)) {
+            await this.initializeForSite(targetSiteId);
+        }
+        
+        const siteCache = this.siteCaches.get(targetSiteId);
+        const normalizedUrl = this.normalizeUrl(url);
+        const urlHash = this.hashUrl(normalizedUrl);
+        
+        return siteCache.urlHashes.has(urlHash);
+    }
+    
+    /**
+     * Enhanced content analysis with duplicate detection and similarity analysis
+     */
+    async analyzeContentForDuplicates(content, metadata = {}, siteId = null) {
+        const targetSiteId = siteId || this.currentSiteId;
+        
+        try {
+            if (!this.options.enableAdvancedDuplication) {
+                // Fall back to basic content hashing
+                return {
+                    contentHash: this.hashContent(content),
+                    duplicateStatus: 'unique',
+                    similarityScore: 0,
+                    processingTime: 0
+                };
+            }
+
+            // Use enhanced duplicate manager for comprehensive analysis
+            const analysisResult = await this.enhancedDuplicateManager.analyzeContent(content, {
+                ...metadata,
+                siteId: targetSiteId,
+                url: metadata.url || null
+            });
+
+            // Update site statistics
+            if (targetSiteId && this.siteCaches.has(targetSiteId)) {
+                const siteCache = this.siteCaches.get(targetSiteId);
+                this.updateSiteStatsFromAnalysis(siteCache, analysisResult);
+            }
+
+            // Update global statistics
+            this.globalStats.contentAnalyzed++;
+            if (analysisResult.duplicateAnalysis.status === 'duplicate') {
+                this.globalStats.duplicatesSkipped++;
+            } else if (analysisResult.duplicateAnalysis.status === 'similar') {
+                this.globalStats.similarContentDetected++;
+            }
+
+            logger.debug('Enhanced content analysis completed', {
+                service: 'SiteAwareDuplicateChecker',
+                siteId: targetSiteId,
+                contentHash: analysisResult.contentHash,
+                duplicateStatus: analysisResult.duplicateAnalysis.status,
+                similarityScore: analysisResult.duplicateAnalysis.maxSimilarity,
+                processingTime: analysisResult.processingTime
+            });
+
+            return {
+                contentHash: analysisResult.contentHash,
+                duplicateStatus: analysisResult.duplicateAnalysis.status,
+                similarityScore: analysisResult.duplicateAnalysis.maxSimilarity,
+                similarContent: analysisResult.duplicateAnalysis.similarContent,
+                clusterId: analysisResult.duplicateAnalysis.clusterId,
+                fingerprint: analysisResult.fingerprint,
+                processingTime: analysisResult.processingTime
+            };
+
+        } catch (error) {
+            logger.error('Enhanced content analysis failed', {
+                service: 'SiteAwareDuplicateChecker',
+                siteId: targetSiteId,
+                error: error.message
+            });
+            
+            // Fall back to basic content hashing
+            return {
+                contentHash: this.hashContent(content),
+                duplicateStatus: 'unique',
+                similarityScore: 0,
+                processingTime: 0,
+                error: error.message
+            };
+        }
+    }
+
+    /**
+     * Update site statistics from content analysis
+     */
+    updateSiteStatsFromAnalysis(siteCache, analysisResult) {
+        const analysis = analysisResult.duplicateAnalysis;
+        
+        if (analysis.status === 'duplicate') {
+            siteCache.stats.duplicatesDetected++;
+        } else if (analysis.status === 'similar') {
+            siteCache.stats.similarContentGroups++;
+        }
+        
+        if (analysis.clusterId) {
+            siteCache.stats.contentClusters++;
+        }
+        
+        // Store fingerprint for site-specific tracking
+        if (analysisResult.fingerprint) {
+            siteCache.contentFingerprints.set(
+                analysisResult.contentHash, 
+                analysisResult.fingerprint
+            );
+        }
+    }
+
+    /**
+     * Check if content is duplicate or similar
+     */
+    async isContentDuplicate(content, metadata = {}, siteId = null) {
+        if (!this.options.enableAdvancedDuplication) {
+            // Basic content hash check
+            const contentHash = this.hashContent(content);
+            const targetSiteId = siteId || this.currentSiteId;
+            
+            if (targetSiteId && this.siteCaches.has(targetSiteId)) {
+                return this.siteCaches.get(targetSiteId).contentHashes.has(contentHash);
+            }
+            return false;
+        }
+
+        // Enhanced duplicate detection
+        const analysis = await this.analyzeContentForDuplicates(content, metadata, siteId);
+        return analysis.duplicateStatus === 'duplicate' || 
+               (analysis.duplicateStatus === 'similar' && analysis.similarityScore >= this.options.similarityThreshold);
+    }
+
+    /**
+     * Mark URL as crawled for the site with enhanced content analysis
+     */
+    async markAsCrawled(url, content = null, siteId = null) {
+        const targetSiteId = siteId || this.currentSiteId;
+        if (!targetSiteId) {
+            logger.warn('No site ID available for marking URL as crawled');
+            return;
+        }
+        
+        // Initialize site if not already done
+        if (!this.siteCaches.has(targetSiteId)) {
+            await this.initializeForSite(targetSiteId);
+        }
+        
+        const siteCache = this.siteCaches.get(targetSiteId);
+        const normalizedUrl = this.normalizeUrl(url);
+        const urlHash = this.hashUrl(normalizedUrl);
+        
+        // Add to site cache
+        siteCache.urlHashes.add(urlHash);
+        siteCache.crawledUrls.add(normalizedUrl);
+        
+        let contentAnalysis = null;
+        
+        if (content && this.options.enableContentHashing) {
+            if (this.options.enableAdvancedDuplication) {
+                // Enhanced content analysis
+                contentAnalysis = await this.analyzeContentForDuplicates(content, { url }, targetSiteId);
+                siteCache.contentHashes.add(contentAnalysis.contentHash);
+            } else {
+                // Basic content hashing
+            const contentHash = this.hashContent(content);
+            siteCache.contentHashes.add(contentHash);
+            }
+        }
+        
+        // Update site statistics
+        siteCache.stats.totalCrawledUrls++;
+        
+        // Clean cache if it gets too large
+        if (siteCache.urlHashes.size > this.options.maxCacheSize) {
+            this.cleanSiteCache(targetSiteId);
+        }
+
+        return contentAnalysis;
+    }
+    
+    /**
+     * Clean site cache to prevent memory issues
+     */
+    cleanSiteCache(siteId) {
+        const siteCache = this.siteCaches.get(siteId);
+        if (!siteCache) return;
+        
+        // Keep only the most recent entries (simple FIFO cleanup)
+        const keepSize = Math.floor(this.options.maxCacheSize * 0.8);
+        
+        if (siteCache.urlHashes.size > keepSize) {
+            // For simplicity, clear and reload from database
+            // In production, you might want a more sophisticated LRU cache
+            logger.info('Cleaning site cache due to size limit', {
+                siteId,
+                oldSize: siteCache.urlHashes.size,
+                keepSize
+            });
+            
+            siteCache.urlHashes.clear();
+            siteCache.crawledUrls.clear();
+            siteCache.contentHashes.clear();
+            
+            // Reload recent data
+            this.loadSiteCrawledUrls(siteId, siteCache).catch(error => {
+                logger.error('Error reloading site cache after cleanup', {
+                    siteId,
+                    error: error.message
+                });
+            });
+        }
+    }
+    
+    /**
+     * Get site-specific statistics
+     */
+    getSiteStats(siteId = null) {
+        const targetSiteId = siteId || this.currentSiteId;
+        if (!targetSiteId || !this.siteCaches.has(targetSiteId)) {
+            return null;
+        }
+        
+        return {
+            ...this.siteCaches.get(targetSiteId).stats,
+            cacheSize: this.siteCaches.get(targetSiteId).urlHashes.size
+        };
+    }
+    
+    /**
+     * Get enhanced global statistics
+     */
+    getGlobalStats() {
+        const enhancedStats = this.enhancedDuplicateManager.getStats();
+        
+        return {
+            ...this.globalStats,
+            activeSites: this.siteCaches.size,
+            totalCacheSize: Array.from(this.siteCaches.values())
+                .reduce((sum, cache) => sum + cache.urlHashes.size, 0),
+            enhancedDuplication: {
+                contentFingerprints: enhancedStats.cacheSize.fingerprints,
+                simHashIndex: enhancedStats.cacheSize.simHashIndex,
+                duplicateClusters: enhancedStats.cacheSize.clusters,
+                avgProcessingTime: enhancedStats.avgProcessingTime,
+                duplicateRate: enhancedStats.duplicateRate,
+                similarityRate: enhancedStats.similarityRate
+            }
+        };
+    }
+
+    /**
+     * Get comprehensive duplicate content report
+     */
+    getDuplicateContentReport() {
+        const enhancedReport = this.enhancedDuplicateManager.getDuplicateReport();
+        const siteReports = [];
+        
+        // Generate site-specific reports
+        for (const [siteId, siteCache] of this.siteCaches) {
+            siteReports.push({
+                siteId,
+                siteUrl: siteCache.stats.siteUrl,
+                totalUrls: siteCache.stats.totalCrawledUrls,
+                uniqueContent: siteCache.stats.uniqueContentHashes,
+                duplicatesDetected: siteCache.stats.duplicatesDetected,
+                similarContentGroups: siteCache.stats.similarContentGroups,
+                contentClusters: siteCache.stats.contentClusters,
+                duplicateRate: siteCache.stats.totalCrawledUrls > 0 ? 
+                    ((siteCache.stats.duplicatesDetected / siteCache.stats.totalCrawledUrls) * 100).toFixed(2) + '%' : '0%',
+                lastCrawlDate: siteCache.stats.lastCrawlDate
+            });
+        }
+        
+        return {
+            summary: {
+                ...enhancedReport.summary,
+                totalSites: this.siteCaches.size,
+                globalStats: this.getGlobalStats()
+            },
+            duplicateClusters: enhancedReport.clusters,
+            siteReports: siteReports.sort((a, b) => b.duplicatesDetected - a.duplicatesDetected),
+            performance: enhancedReport.performance,
+            recommendations: this.generateRecommendations(siteReports, enhancedReport)
+        };
+    }
+
+    /**
+     * Generate recommendations based on duplicate analysis
+     */
+    generateRecommendations(siteReports, enhancedReport) {
+        const recommendations = [];
+        
+        // High duplicate rate sites
+        const highDuplicateSites = siteReports.filter(site => {
+            const rate = parseFloat(site.duplicateRate.replace('%', ''));
+            return rate > 20; // More than 20% duplicates
+        });
+        
+        if (highDuplicateSites.length > 0) {
+            recommendations.push({
+                type: 'HIGH_DUPLICATE_RATE',
+                priority: 'high',
+                description: `${highDuplicateSites.length} sites have high duplicate content rates (>20%)`,
+                action: 'Review crawling strategies and content filtering for these sites',
+                affectedSites: highDuplicateSites.map(s => s.siteId)
+            });
+        }
+        
+        // Large clusters that could be merged
+        const largeClusters = enhancedReport.clusters.filter(cluster => cluster.memberCount > 5);
+        if (largeClusters.length > 0) {
+            recommendations.push({
+                type: 'LARGE_CONTENT_CLUSTERS',
+                priority: 'medium',
+                description: `${largeClusters.length} content clusters have more than 5 similar items`,
+                action: 'Consider implementing automatic content merging for these clusters',
+                clusterIds: largeClusters.map(c => c.id)
+            });
+        }
+        
+        // Performance optimization
+        if (enhancedReport.performance.avgProcessingTime > 100) {
+            recommendations.push({
+                type: 'PERFORMANCE_OPTIMIZATION',
+                priority: 'low',
+                description: 'Content analysis processing time is higher than optimal',
+                action: 'Consider increasing similarity threshold or reducing content analysis scope',
+                currentAvgTime: enhancedReport.performance.avgProcessingTime
+            });
+        }
+        
+        // Content savings opportunities
+        const totalContentSaved = enhancedReport.summary.contentSaved;
+        if (totalContentSaved > 100) {
+            recommendations.push({
+                type: 'CONTENT_SAVINGS',
+                priority: 'info',
+                description: `Duplicate detection saved processing ${totalContentSaved} duplicate content items`,
+                action: 'Current duplicate detection is working effectively',
+                contentSaved: totalContentSaved
+            });
+        }
+        
+        return recommendations;
+    }
+
+    /**
+     * Get content cluster details
+     */
+    getContentClusterDetails(clusterId) {
+        return this.enhancedDuplicateManager.duplicateClusters.get(clusterId);
+    }
+
+    /**
+     * Get similar content for a given content hash
+     */
+    async findSimilarContent(contentHash, threshold = null) {
+        const fingerprint = this.enhancedDuplicateManager.contentFingerprints.get(contentHash);
+        if (!fingerprint) {
+            return [];
+        }
+        
+        const similarityThreshold = threshold || this.options.similarityThreshold;
+        return this.enhancedDuplicateManager.findSimilarContent(fingerprint.simHash)
+            .filter(similar => similar.similarity >= similarityThreshold);
+    }
+    
+    /**
+     * Utility methods
+     */
+    normalizeUrl(url) {
+        try {
+            const urlObj = new URL(url);
+            // Remove common tracking parameters
+            urlObj.searchParams.delete('utm_source');
+            urlObj.searchParams.delete('utm_medium');
+            urlObj.searchParams.delete('utm_campaign');
+            urlObj.searchParams.delete('fbclid');
+            urlObj.searchParams.delete('gclid');
+            
+            // Remove trailing slash and fragments
+            let normalized = urlObj.href.replace(/#.*$/, '').replace(/\/$/, '');
+            return normalized;
+        } catch (error) {
+            return url; // Return original if normalization fails
+        }
+    }
+    
+    hashUrl(url) {
+        return crypto.createHash('sha256').update(url).digest('hex');
+    }
+    
+    hashContent(content) {
+        if (!content) return null;
+        const normalized = content.replace(/\s+/g, ' ').trim().toLowerCase();
+        return crypto.createHash('sha256').update(normalized).digest('hex');
+    }
+    
+    async executeQuery(query, params = []) {
+        try {
+            if (!this.dbConnection) {
+                throw new Error('Database connection not available');
+            }
+            
+            return await this.dbConnection.query(query, params);
+        } catch (error) {
+            logger.error('Database query error', {
+                query: query.substring(0, 100),
+                error: error.message
+            });
+            throw error;
+        }
+    }
+    
+    /**
+     * Clear all site caches
+     */
+    clearAllCaches() {
+        this.siteCaches.clear();
+        this.currentSiteId = null;
+        this.currentSiteStats = null;
+        logger.info('All site caches cleared');
+    }
+    
+    /**
+     * Clear specific site cache
+     */
+    clearSiteCache(siteId) {
+        if (this.siteCaches.has(siteId)) {
+            this.siteCaches.delete(siteId);
+            if (this.currentSiteId === siteId) {
+                this.currentSiteId = null;
+                this.currentSiteStats = null;
+            }
+            logger.info('Site cache cleared', { siteId });
+        }
+    }
+}
+
+module.exports = { SiteAwareDuplicateChecker }; 

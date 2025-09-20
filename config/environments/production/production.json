@@ -1,0 +1,183 @@
+{
+  "app": {
+    "env": "production",
+    "debug": false,
+    "port": 80,
+    "maintenance": false,
+    "clusterWorkers": "auto",
+    "cors": {
+      "enabled": true,
+      "origins": ["https://bhoomy.in", "https://admin.bhoomy.com"],
+      "credentials": true
+    }
+  },
+  "database": {
+    "host": "prod-db-cluster.bhoomy.internal",
+    "port": 3306,
+    "name": "mybhoomy_production",
+    "user": "mybhoomy_prod",
+    "connectionLimit": 50,
+    "timeout": 60000,
+    "ssl": true,
+    "enableSlowQueryLogging": true,
+    "slowQueryThreshold": 2000,
+    "enablePerformanceOptimization": true,
+    "enableQueryCaching": true
+  },
+  "elasticsearch": {
+    "url": "https://prod-elasticsearch-cluster.bhoomy.internal:9200",
+    "requestTimeout": 30000,
+    "pingTimeout": 3000,
+    "maxRetries": 3,
+    "maxSockets": 100,
+    "ssl": {
+      "verify": true,
+      "rejectUnauthorized": true
+    },
+    "indices": {
+      "main": "bhoomy_search_prod",
+      "analytics": "search_analytics_prod",
+      "images": "site_img_prod",
+      "videos": "site_videos_prod",
+      "documents": "site_doc_prod"
+    }
+  },
+  "redis": {
+    "enabled": true,
+    "host": "prod-redis-cluster.bhoomy.internal",
+    "port": 6379,
+    "keyPrefix": "bhoomy:prod:",
+    "maxConnections": 50,
+    "compression": true,
+    "defaultTTL": 3600,
+    "searchCacheTTL": 900,
+    "imageCacheTTL": 3600,
+    "videoCacheTTL": 7200
+  },
+  "security": {
+    "rateLimiting": {
+      "enabled": true,
+      "maxRequests": 500,
+      "windowMs": 900000,
+      "standardHeaders": true,
+      "legacyHeaders": false
+    },
+    "session": {
+      "secure": true,
+      "maxAge": 28800000,
+      "sameSite": "strict",
+      "httpOnly": true
+    },
+    "headers": {
+      "contentSecurityPolicy": true,
+      "crossOriginEmbedderPolicy": true,
+      "crossOriginOpenerPolicy": true,
+      "strictTransportSecurity": true,
+      "xContentTypeOptions": true,
+      "xFrameOptions": "DENY",
+      "xPoweredBy": false,
+      "xXssProtection": true
+    }
+  },
+  "logging": {
+    "level": "warn",
+    "enableConsole": false,
+    "colorize": false,
+    "enablePerformanceLogs": true,
+    "enableSlowQueryLogs": true,
+    "enableAccessLogs": true,
+    "file": "logs/production.log",
+    "errorFile": "logs/production-error.log",
+    "maxSize": "100m",
+    "maxFiles": 30,
+    "enableRotation": true,
+    "rotationInterval": "daily",
+    "enableStructuredLogs": true,
+    "logRequestId": true
+  },
+  "performance": {
+    "enableCaching": true,
+    "cacheDefaultTTL": 900,
+    "cacheMaxSize": 5000,
+    "enableCompression": true,
+    "compressionLevel": 9,
+    "compressionThreshold": 512,
+    "enableDatabasePooling": true,
+    "enableQueryOptimization": true,
+    "enableIndexOptimization": true,
+    "enableSearchCaching": true,
+    "enableResultPrefetching": true,
+    "enableQueryExpansion": true,
+    "enablePerformanceMonitoring": true,
+    "monitoringInterval": 60000,
+    "enableAlerts": true,
+    "alertThresholds": {
+      "responseTime": 1000,
+      "memoryUsage": 80,
+      "cpuUsage": 80,
+      "errorRate": 1
+    }
+  },
+  "search": {
+    "resultsPerPage": 20,
+    "maxResults": 1000,
+    "enableAutoComplete": true,
+    "enableSpellCheck": true,
+    "enableFacetedSearch": true,
+    "enableSemanticSearch": true,
+    "enableImageSearch": true,
+    "enableVideoSearch": true,
+    "enableDocumentSearch": true,
+    "enableNewsSearch": true,
+    "enableSearchAnalytics": true,
+    "enableSearchSuggestions": true,
+    "trackSearchQueries": true,
+    "trackClickThrough": true,
+    "analyticsRetentionDays": 365
+  },
+  "api": {
+    "enableDocumentation": false,
+    "enableRequestLogging": true,
+    "enableValidation": true,
+    "enableRateLimiting": true,
+    "enableCompression": true,
+    "enableApiKeys": true,
+    "externalApis": {
+      "youtube": {
+        "enabled": true,
+        "quotaLimit": 50000
+      },
+      "google": {
+        "enabled": true
+      }
+    }
+  },
+  "ui": {
+    "theme": "light",
+    "enableFilters": true,
+    "enableSorting": true,
+    "enableSuggestions": true,
+    "enableKeyboardShortcuts": true,
+    "lazyLoadImages": true,
+    "enableVirtualization": true,
+    "enablePrefetching": true,
+    "brandName": "Bhoomy Search"
+  },
+  "monitoring": {
+    "enabled": true,
+    "healthCheckEnabled": true,
+    "healthCheckInterval": 30000,
+    "metricsEnabled": true,
+    "metricsPort": 9090,
+    "alerting": {
+      "enabled": true,
+      "channels": ["email", "slack", "webhook"],
+      "thresholds": {
+        "responseTime": 2000,
+        "errorRate": 1,
+        "memoryUsage": 85,
+        "diskUsage": 85
+      }
+    }
+  }
+}
