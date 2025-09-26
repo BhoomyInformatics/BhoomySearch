@@ -422,8 +422,8 @@ class ContentIndexer {
 
             let result;
             try {
-                // Use faster query execution with optimized timeout
-                result = await this.dbConnection.query(insertQuery, values, { timeout: 30000 });
+                // Use direct query for data insertion
+                result = await this.dbConnection.query(insertQuery, values);
             } catch (insertError) {
                 // Handle duplicate key errors gracefully
                 if (insertError.code === 'ER_DUP_ENTRY') {
@@ -1093,7 +1093,8 @@ class ContentIndexer {
             // Log performance metrics for monitoring
             if (batchResult.stats.runtime) {
                 const runtimeMs = parseInt(batchResult.stats.runtime.replace('ms', ''));
-                if (runtimeMs > 10000) { // Log slow batches (>10 seconds)
+                const thresholdMs = parseInt(process.env.SLOW_MEDIA_THRESHOLD_MS || '15000');
+                if (runtimeMs > thresholdMs) { // Log slow batches over threshold
                     logger.warn('Slow media batch processing detected', {
                         url,
                         runtime: batchResult.stats.runtime,

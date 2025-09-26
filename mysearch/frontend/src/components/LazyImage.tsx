@@ -33,8 +33,17 @@ const getFallbackUrl = (url: string): string => {
   return url;
 };
 
-// Cache for failed image URLs to avoid retrying
+// Cache for failed image URLs to avoid retrying bad URLs
 const failedImageCache = new Set<string>();
+// Track in-flight loads so multiple instances don't stampede
+const inFlightLoads = new Set<string>();
+// Cooldown between retries per URL
+const lastAttemptAt = new Map<string, number>();
+const RETRY_COOLDOWN_MS = 15000; // 15s
+
+// Backoff after failure for each URL to avoid IP rate limits
+const lastFailureAt = new Map<string, number>();
+const FAILURE_BACKOFF_MS = 20000; // 20 seconds
 
 // Helper function to check if URL has failed before
 const hasFailedBefore = (url: string): boolean => {
@@ -43,7 +52,14 @@ const hasFailedBefore = (url: string): boolean => {
 
 // Helper function to mark URL as failed
 const markAsFailed = (url: string): void => {
+  if (!url) return;
   failedImageCache.add(url);
+};
+
+// Helper to clear failed state (on successful load)
+const unmarkFailed = (url: string): void => {
+  if (!url) return;
+  failedImageCache.delete(url);
 };
 
 interface LazyImageProps {
@@ -71,17 +87,12 @@ const LazyImage: React.FC<LazyImageProps> = ({
 }) => {
   const [isLoaded, setIsLoaded] = useState(false);
   const [isInView, setIsInView] = useState(false);
-  const [hasError, setHasError] = useState(false);
-  const [currentSrc, setCurrentSrc] = useState(() => {
-    // Check if this URL has failed before
-    if (hasFailedBefore(src)) {
-      setHasError(true);
-      return placeholder;
-    }
-    return getImageUrl(src);
-  });
+  const [hasError, setHasError] = useState(() => hasFailedBefore(src));
+  const [currentSrc, setCurrentSrc] = useState(() => (hasFailedBefore(src) ? placeholder : getImageUrl(src)));
+  const [wasEverLoaded, setWasEverLoaded] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
   const [loadingTimeout, setLoadingTimeout] = useState<NodeJS.Timeout | null>(null);
+  const [backoffTimer, setBackoffTimer] = useState<NodeJS.Timeout | null>(null);
   const imgRef = useRef<HTMLDivElement>(null);
 
   // Intersection Observer callback
@@ -89,20 +100,27 @@ const LazyImage: React.FC<LazyImageProps> = ({
     const [entry] = entries;
     if (entry.isIntersecting) {
       setIsInView(true);
-      
-      // Set a timeout to show error if image doesn't load within 10 seconds
+      // Do not auto-retry on scroll to prevent request storms and rate limits
+      // Only show placeholder; user can tap to retry, and we enforce cooldown
+      // Set a timeout to show placeholder if image doesn't load soon while in view
       const timeout = setTimeout(() => {
-        if (!isLoaded && !hasError) {
-          console.warn('⏰ LazyImage: Loading timeout for:', currentSrc);
-          markAsFailed(currentSrc);
+        if (!isLoaded && !hasError && !wasEverLoaded) {
+          console.warn('⏰ LazyImage: In-view loading timeout for:', currentSrc);
+          // Do NOT cache as failed on timeout; allow retry when back in view
           setHasError(true);
           setIsLoaded(true);
         }
-      }, 10000); // 10 second timeout
-      
+      }, 6000); // 6s timeout while visible
       setLoadingTimeout(timeout);
+    } else {
+      // When image leaves viewport, clear any pending timeout to avoid false failures
+      setIsInView(false);
+      if (loadingTimeout) {
+        clearTimeout(loadingTimeout);
+        setLoadingTimeout(null);
+      }
     }
-  }, [currentSrc, isLoaded, hasError]);
+  }, [currentSrc, isLoaded, hasError, loadingTimeout]);
 
   // Set up Intersection Observer
   useEffect(() => {
@@ -123,8 +141,11 @@ const LazyImage: React.FC<LazyImageProps> = ({
       if (loadingTimeout) {
         clearTimeout(loadingTimeout);
       }
+      if (backoffTimer) {
+        clearTimeout(backoffTimer);
+      }
     };
-  }, [handleIntersection, threshold, rootMargin, loadingTimeout]);
+  }, [handleIntersection, threshold, rootMargin, loadingTimeout, backoffTimer]);
 
   // Handle image load
   const handleLoad = useCallback(() => {
@@ -135,12 +156,22 @@ const LazyImage: React.FC<LazyImageProps> = ({
     }
     
     setIsLoaded(true);
+    setHasError(false);
+    setWasEverLoaded(true);
+    // Successful load: clear any previous failure flags for both original and current
+    unmarkFailed(src);
+    unmarkFailed(currentSrc);
+    inFlightLoads.delete(currentSrc);
     onLoad?.();
   }, [onLoad, loadingTimeout]);
 
   // Handle image error with fallback
   const handleError = useCallback(() => {
     console.warn('⚠️ LazyImage: Failed to load image, trying fallback:', currentSrc);
+    if (wasEverLoaded) {
+      // If it was already shown once, don't flip to error when re-entering view
+      return;
+    }
     
     // Clear loading timeout
     if (loadingTimeout) {
@@ -148,9 +179,12 @@ const LazyImage: React.FC<LazyImageProps> = ({
       setLoadingTimeout(null);
     }
     
-    // Mark the current URL as failed
+    // Mark the current URL as failed only for real network errors
     markAsFailed(currentSrc);
-    
+    inFlightLoads.delete(currentSrc);
+    // Start a 20s backoff for this URL
+    lastFailureAt.set(src, Date.now());
+
     // If we're using proxy and it fails, try original URL
     if (currentSrc.startsWith('/api/image-proxy') && retryCount === 0) {
       const originalUrl = getFallbackUrl(src);
@@ -158,13 +192,14 @@ const LazyImage: React.FC<LazyImageProps> = ({
       // Check if original URL has also failed before
       if (hasFailedBefore(originalUrl)) {
         console.log('❌ LazyImage: Original URL also failed before, skipping');
-        setHasError(true);
+      setHasError(true);
         setIsLoaded(true);
         return;
       }
       
       console.log('🔄 LazyImage: Trying fallback URL:', originalUrl);
       
+      lastAttemptAt.set(originalUrl, Date.now());
       setCurrentSrc(originalUrl);
       setRetryCount(1);
       setHasError(false);
@@ -174,8 +209,16 @@ const LazyImage: React.FC<LazyImageProps> = ({
       markAsFailed(src); // Mark the original source as failed
       setHasError(true);
       setIsLoaded(true);
+      // Auto retry after backoff window to avoid continuous fetches
+      const t = setTimeout(() => {
+        setHasError(false);
+        setIsLoaded(false);
+        setRetryCount(0);
+        setCurrentSrc(getImageUrl(src));
+      }, FAILURE_BACKOFF_MS);
+      setBackoffTimer(t as unknown as NodeJS.Timeout);
     }
-  }, [currentSrc, src, retryCount, loadingTimeout]);
+  }, [currentSrc, src, retryCount, loadingTimeout, wasEverLoaded]);
 
   return (
     <div
@@ -216,9 +259,9 @@ const LazyImage: React.FC<LazyImageProps> = ({
       )}
 
       {/* Actual image */}
-      {isInView && (
+      {isInView && (wasEverLoaded || !hasError) && (
         <motion.img
-          src={hasError ? placeholder : currentSrc}
+          src={wasEverLoaded ? currentSrc : (hasError ? placeholder : currentSrc)}
           alt={alt}
           onLoad={handleLoad}
           onError={handleError}
@@ -239,7 +282,7 @@ const LazyImage: React.FC<LazyImageProps> = ({
       )}
 
       {/* Error state */}
-      {hasError && (
+      {hasError && !wasEverLoaded && (
         <div
           style={{
             position: 'absolute',
@@ -264,6 +307,17 @@ const LazyImage: React.FC<LazyImageProps> = ({
               onClick();
             } else {
               // Retry loading the image
+              const now = Date.now();
+              const last = lastAttemptAt.get(src) || 0;
+              if (now - last < RETRY_COOLDOWN_MS) {
+                // Cooldown active; ignore rapid retries
+                return;
+              }
+              if (inFlightLoads.has(src)) {
+                return; // Deduplicate in-flight retries
+              }
+              lastAttemptAt.set(src, now);
+              inFlightLoads.add(src);
               console.log('🔄 LazyImage: Retrying image load');
               setHasError(false);
               setIsLoaded(false);

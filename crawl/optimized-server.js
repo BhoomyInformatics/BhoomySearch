@@ -263,10 +263,6 @@ class OptimizedServer {
                 console.log(`   🔄 Duplicates skipped: ${result.duplicatesSkipped || 0}`);
                 console.log(`   💾 HTTP requests saved: ${result.httpRequestsSaved || 0}`);
                 console.log(`   📊 Efficiency: ${result.crawlEfficiency || 0}%`);
-                if (result) {
-                    const indexed = (result.newPagesIndexed ?? result.indexedToDatabase ?? result.uniquePages) || 0;
-                    console.log(`   📄 New pages indexed: ${indexed}`);
-                }
                 
                 if (result.performanceMetrics) {
                     console.log(`   ⚡ Performance: Init ${result.performanceMetrics.initializationTime}ms, Crawl ${Math.round(result.performanceMetrics.totalCrawlTime / 1000)}s`);

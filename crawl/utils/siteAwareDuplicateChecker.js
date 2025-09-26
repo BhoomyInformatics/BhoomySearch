@@ -1,12 +1,11 @@
 const crypto = require('crypto');
 const { logger } = require('./logger');
 const { duplicateChecker } = require('./duplicateChecker');
-const { EnhancedDuplicateManager } = require('./enhanced-duplicate-manager');
 
 /**
  * Site-Aware Duplicate Checker
- * Enhanced version with advanced content-based duplicate detection, similarity analysis,
- * and smart URL filtering to maximize crawling efficiency
+ * Enhanced version that initializes with site-specific statistics and provides
+ * smart URL filtering to maximize crawling efficiency
  */
 class SiteAwareDuplicateChecker {
     constructor(dbConnection, options = {}) {
@@ -15,48 +14,26 @@ class SiteAwareDuplicateChecker {
             maxCacheSize: 50000,
             batchSize: 500,
             enableContentHashing: true,
-            enableAdvancedDuplication: true,
-            enableSimilarityDetection: true,
-            enableContentMerging: true,
-            similarityThreshold: 0.85,
             ...options
         };
         
         // Site-specific caches
-        this.siteCaches = new Map(); // siteId -> { crawledUrls, urlHashes, contentHashes, contentFingerprints, stats }
+        this.siteCaches = new Map(); // siteId -> { crawledUrls, urlHashes, contentHashes, stats }
         this.currentSiteId = null;
         this.currentSiteStats = null;
         
-        // Enhanced duplicate management
-        this.enhancedDuplicateManager = new EnhancedDuplicateManager(dbConnection, {
-            maxCacheSize: this.options.maxCacheSize,
-            similarityThreshold: this.options.similarityThreshold,
-            enableSimilarityDetection: this.options.enableSimilarityDetection,
-            enableContentMerging: this.options.enableContentMerging
-        });
-        
-        // Global statistics (enhanced)
+        // Global statistics
         this.globalStats = {
             sitesInitialized: 0,
             totalUrlsChecked: 0,
             duplicatesSkipped: 0,
             newUrlsFound: 0,
-            httpRequestsSaved: 0,
-            contentAnalyzed: 0,
-            similarContentDetected: 0,
-            contentClustersCreated: 0,
-            contentMerged: 0
+            httpRequestsSaved: 0
         };
         
-        logger.info('Enhanced SiteAwareDuplicateChecker initialized', {
-            service: 'SiteAwareDuplicateChecker',
+        logger.info('SiteAwareDuplicateChecker initialized', {
             options: this.options,
-            hasDbConnection: !!this.dbConnection,
-            enhancedFeatures: {
-                contentBasedDeduplication: this.options.enableAdvancedDuplication,
-                similarityDetection: this.options.enableSimilarityDetection,
-                contentMerging: this.options.enableContentMerging
-            }
+            hasDbConnection: !!this.dbConnection
         });
     }
 
@@ -78,20 +55,16 @@ class SiteAwareDuplicateChecker {
                 return this.currentSiteStats;
             }
             
-            // Initialize site cache with enhanced features
+            // Initialize site cache
             const siteCache = {
                 crawledUrls: new Set(),
                 urlHashes: new Set(),
                 contentHashes: new Set(),
-                contentFingerprints: new Map(), // contentHash -> fingerprint data
                 stats: {
                     siteId,
                     siteUrl,
                     totalCrawledUrls: 0,
                     uniqueContentHashes: 0,
-                    similarContentGroups: 0,
-                    contentClusters: 0,
-                    duplicatesDetected: 0,
                     lastCrawlDate: null,
                     urlsAddedToday: 0,
                     avgDailyUrls: 0,
@@ -368,128 +341,7 @@ class SiteAwareDuplicateChecker {
     }
     
     /**
-     * Enhanced content analysis with duplicate detection and similarity analysis
-     */
-    async analyzeContentForDuplicates(content, metadata = {}, siteId = null) {
-        const targetSiteId = siteId || this.currentSiteId;
-        
-        try {
-            if (!this.options.enableAdvancedDuplication) {
-                // Fall back to basic content hashing
-                return {
-                    contentHash: this.hashContent(content),
-                    duplicateStatus: 'unique',
-                    similarityScore: 0,
-                    processingTime: 0
-                };
-            }
-
-            // Use enhanced duplicate manager for comprehensive analysis
-            const analysisResult = await this.enhancedDuplicateManager.analyzeContent(content, {
-                ...metadata,
-                siteId: targetSiteId,
-                url: metadata.url || null
-            });
-
-            // Update site statistics
-            if (targetSiteId && this.siteCaches.has(targetSiteId)) {
-                const siteCache = this.siteCaches.get(targetSiteId);
-                this.updateSiteStatsFromAnalysis(siteCache, analysisResult);
-            }
-
-            // Update global statistics
-            this.globalStats.contentAnalyzed++;
-            if (analysisResult.duplicateAnalysis.status === 'duplicate') {
-                this.globalStats.duplicatesSkipped++;
-            } else if (analysisResult.duplicateAnalysis.status === 'similar') {
-                this.globalStats.similarContentDetected++;
-            }
-
-            logger.debug('Enhanced content analysis completed', {
-                service: 'SiteAwareDuplicateChecker',
-                siteId: targetSiteId,
-                contentHash: analysisResult.contentHash,
-                duplicateStatus: analysisResult.duplicateAnalysis.status,
-                similarityScore: analysisResult.duplicateAnalysis.maxSimilarity,
-                processingTime: analysisResult.processingTime
-            });
-
-            return {
-                contentHash: analysisResult.contentHash,
-                duplicateStatus: analysisResult.duplicateAnalysis.status,
-                similarityScore: analysisResult.duplicateAnalysis.maxSimilarity,
-                similarContent: analysisResult.duplicateAnalysis.similarContent,
-                clusterId: analysisResult.duplicateAnalysis.clusterId,
-                fingerprint: analysisResult.fingerprint,
-                processingTime: analysisResult.processingTime
-            };
-
-        } catch (error) {
-            logger.error('Enhanced content analysis failed', {
-                service: 'SiteAwareDuplicateChecker',
-                siteId: targetSiteId,
-                error: error.message
-            });
-            
-            // Fall back to basic content hashing
-            return {
-                contentHash: this.hashContent(content),
-                duplicateStatus: 'unique',
-                similarityScore: 0,
-                processingTime: 0,
-                error: error.message
-            };
-        }
-    }
-
-    /**
-     * Update site statistics from content analysis
-     */
-    updateSiteStatsFromAnalysis(siteCache, analysisResult) {
-        const analysis = analysisResult.duplicateAnalysis;
-        
-        if (analysis.status === 'duplicate') {
-            siteCache.stats.duplicatesDetected++;
-        } else if (analysis.status === 'similar') {
-            siteCache.stats.similarContentGroups++;
-        }
-        
-        if (analysis.clusterId) {
-            siteCache.stats.contentClusters++;
-        }
-        
-        // Store fingerprint for site-specific tracking
-        if (analysisResult.fingerprint) {
-            siteCache.contentFingerprints.set(
-                analysisResult.contentHash, 
-                analysisResult.fingerprint
-            );
-        }
-    }
-
-    /**
-     * Check if content is duplicate or similar
-     */
-    async isContentDuplicate(content, metadata = {}, siteId = null) {
-        if (!this.options.enableAdvancedDuplication) {
-            // Basic content hash check
-            const contentHash = this.hashContent(content);
-            const targetSiteId = siteId || this.currentSiteId;
-            
-            if (targetSiteId && this.siteCaches.has(targetSiteId)) {
-                return this.siteCaches.get(targetSiteId).contentHashes.has(contentHash);
-            }
-            return false;
-        }
-
-        // Enhanced duplicate detection
-        const analysis = await this.analyzeContentForDuplicates(content, metadata, siteId);
-        return analysis.duplicateStatus === 'duplicate' || 
-               (analysis.duplicateStatus === 'similar' && analysis.similarityScore >= this.options.similarityThreshold);
-    }
-
-    /**
-     * Mark URL as crawled for the site with enhanced content analysis
+     * Mark URL as crawled for the site
      */
     async markAsCrawled(url, content = null, siteId = null) {
         const targetSiteId = siteId || this.currentSiteId;
@@ -511,18 +363,9 @@ class SiteAwareDuplicateChecker {
         siteCache.urlHashes.add(urlHash);
         siteCache.crawledUrls.add(normalizedUrl);
         
-        let contentAnalysis = null;
-        
         if (content && this.options.enableContentHashing) {
-            if (this.options.enableAdvancedDuplication) {
-                // Enhanced content analysis
-                contentAnalysis = await this.analyzeContentForDuplicates(content, { url }, targetSiteId);
-                siteCache.contentHashes.add(contentAnalysis.contentHash);
-            } else {
-                // Basic content hashing
             const contentHash = this.hashContent(content);
             siteCache.contentHashes.add(contentHash);
-            }
         }
         
         // Update site statistics
@@ -532,8 +375,6 @@ class SiteAwareDuplicateChecker {
         if (siteCache.urlHashes.size > this.options.maxCacheSize) {
             this.cleanSiteCache(targetSiteId);
         }
-
-        return contentAnalysis;
     }
     
     /**
@@ -585,142 +426,15 @@ class SiteAwareDuplicateChecker {
     }
     
     /**
-     * Get enhanced global statistics
+     * Get global statistics
      */
     getGlobalStats() {
-        const enhancedStats = this.enhancedDuplicateManager.getStats();
-        
         return {
             ...this.globalStats,
             activeSites: this.siteCaches.size,
             totalCacheSize: Array.from(this.siteCaches.values())
-                .reduce((sum, cache) => sum + cache.urlHashes.size, 0),
-            enhancedDuplication: {
-                contentFingerprints: enhancedStats.cacheSize.fingerprints,
-                simHashIndex: enhancedStats.cacheSize.simHashIndex,
-                duplicateClusters: enhancedStats.cacheSize.clusters,
-                avgProcessingTime: enhancedStats.avgProcessingTime,
-                duplicateRate: enhancedStats.duplicateRate,
-                similarityRate: enhancedStats.similarityRate
-            }
+                .reduce((sum, cache) => sum + cache.urlHashes.size, 0)
         };
-    }
-
-    /**
-     * Get comprehensive duplicate content report
-     */
-    getDuplicateContentReport() {
-        const enhancedReport = this.enhancedDuplicateManager.getDuplicateReport();
-        const siteReports = [];
-        
-        // Generate site-specific reports
-        for (const [siteId, siteCache] of this.siteCaches) {
-            siteReports.push({
-                siteId,
-                siteUrl: siteCache.stats.siteUrl,
-                totalUrls: siteCache.stats.totalCrawledUrls,
-                uniqueContent: siteCache.stats.uniqueContentHashes,
-                duplicatesDetected: siteCache.stats.duplicatesDetected,
-                similarContentGroups: siteCache.stats.similarContentGroups,
-                contentClusters: siteCache.stats.contentClusters,
-                duplicateRate: siteCache.stats.totalCrawledUrls > 0 ? 
-                    ((siteCache.stats.duplicatesDetected / siteCache.stats.totalCrawledUrls) * 100).toFixed(2) + '%' : '0%',
-                lastCrawlDate: siteCache.stats.lastCrawlDate
-            });
-        }
-        
-        return {
-            summary: {
-                ...enhancedReport.summary,
-                totalSites: this.siteCaches.size,
-                globalStats: this.getGlobalStats()
-            },
-            duplicateClusters: enhancedReport.clusters,
-            siteReports: siteReports.sort((a, b) => b.duplicatesDetected - a.duplicatesDetected),
-            performance: enhancedReport.performance,
-            recommendations: this.generateRecommendations(siteReports, enhancedReport)
-        };
-    }
-
-    /**
-     * Generate recommendations based on duplicate analysis
-     */
-    generateRecommendations(siteReports, enhancedReport) {
-        const recommendations = [];
-        
-        // High duplicate rate sites
-        const highDuplicateSites = siteReports.filter(site => {
-            const rate = parseFloat(site.duplicateRate.replace('%', ''));
-            return rate > 20; // More than 20% duplicates
-        });
-        
-        if (highDuplicateSites.length > 0) {
-            recommendations.push({
-                type: 'HIGH_DUPLICATE_RATE',
-                priority: 'high',
-                description: `${highDuplicateSites.length} sites have high duplicate content rates (>20%)`,
-                action: 'Review crawling strategies and content filtering for these sites',
-                affectedSites: highDuplicateSites.map(s => s.siteId)
-            });
-        }
-        
-        // Large clusters that could be merged
-        const largeClusters = enhancedReport.clusters.filter(cluster => cluster.memberCount > 5);
-        if (largeClusters.length > 0) {
-            recommendations.push({
-                type: 'LARGE_CONTENT_CLUSTERS',
-                priority: 'medium',
-                description: `${largeClusters.length} content clusters have more than 5 similar items`,
-                action: 'Consider implementing automatic content merging for these clusters',
-                clusterIds: largeClusters.map(c => c.id)
-            });
-        }
-        
-        // Performance optimization
-        if (enhancedReport.performance.avgProcessingTime > 100) {
-            recommendations.push({
-                type: 'PERFORMANCE_OPTIMIZATION',
-                priority: 'low',
-                description: 'Content analysis processing time is higher than optimal',
-                action: 'Consider increasing similarity threshold or reducing content analysis scope',
-                currentAvgTime: enhancedReport.performance.avgProcessingTime
-            });
-        }
-        
-        // Content savings opportunities
-        const totalContentSaved = enhancedReport.summary.contentSaved;
-        if (totalContentSaved > 100) {
-            recommendations.push({
-                type: 'CONTENT_SAVINGS',
-                priority: 'info',
-                description: `Duplicate detection saved processing ${totalContentSaved} duplicate content items`,
-                action: 'Current duplicate detection is working effectively',
-                contentSaved: totalContentSaved
-            });
-        }
-        
-        return recommendations;
-    }
-
-    /**
-     * Get content cluster details
-     */
-    getContentClusterDetails(clusterId) {
-        return this.enhancedDuplicateManager.duplicateClusters.get(clusterId);
-    }
-
-    /**
-     * Get similar content for a given content hash
-     */
-    async findSimilarContent(contentHash, threshold = null) {
-        const fingerprint = this.enhancedDuplicateManager.contentFingerprints.get(contentHash);
-        if (!fingerprint) {
-            return [];
-        }
-        
-        const similarityThreshold = threshold || this.options.similarityThreshold;
-        return this.enhancedDuplicateManager.findSimilarContent(fingerprint.simHash)
-            .filter(similar => similar.similarity >= similarityThreshold);
     }
     
     /**

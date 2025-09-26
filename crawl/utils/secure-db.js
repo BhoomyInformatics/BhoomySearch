@@ -32,6 +32,11 @@ class SecureDatabase {
             /((\%22)|(\"))/gi
         ];
 
+        // Simple rate limiter for warnings to avoid log spam
+        this.warningCounters = new Map();
+        this.warningWindowMs = 60000; // 1 minute window
+        this.maxWarningsPerKey = 5; // per minute per key
+
         // Safe character whitelist for different contexts
         this.whitelists = {
             alphanumeric: /^[a-zA-Z0-9_-]+$/,
@@ -66,15 +71,34 @@ class SecureDatabase {
             // Convert to string for processing
             let sanitized = String(input);
 
-            // Check for dangerous patterns
+            // Check for dangerous patterns with rate-limited warnings
             for (const pattern of this.dangerousPatterns) {
                 if (pattern.test(sanitized)) {
-                    logger.warn('Potentially dangerous SQL pattern detected', {
-                        input: sanitized.substring(0, 100),
-                        pattern: pattern.source,
-                        context
-                    });
-                    
+                    const key = `${pattern.source}:${context}`;
+                    const now = Date.now();
+                    const bucket = this.warningCounters.get(key) || { count: 0, start: now };
+                    if (now - bucket.start > this.warningWindowMs) {
+                        bucket.count = 0;
+                        bucket.start = now;
+                    }
+                    bucket.count++;
+                    this.warningCounters.set(key, bucket);
+
+                    if (bucket.count <= this.maxWarningsPerKey) {
+                        logger.warn('Potentially dangerous SQL pattern detected', {
+                            input: sanitized.substring(0, 100),
+                            pattern: pattern.source,
+                            context,
+                            warningsInWindow: bucket.count
+                        });
+                    } else if (bucket.count === this.maxWarningsPerKey + 1) {
+                        logger.warn('Further similar SQL warnings will be suppressed temporarily', {
+                            pattern: pattern.source,
+                            context,
+                            windowMs: this.warningWindowMs
+                        });
+                    }
+
                     // Remove or escape dangerous patterns
                     sanitized = sanitized.replace(pattern, '');
                 }

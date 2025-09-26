@@ -179,7 +179,25 @@ router.get('/search', asyncHandler(async (req, res) => {
         
         if (!searchResults.results || searchResults.results.length === 0) {
             console.log('No results found in searchResults.results');
-            throw new Error('No search results found');
+            
+            // Return empty results instead of throwing an error
+            const time_taken = Date.now() - startTime;
+            
+            return res.json({
+                success: true,
+                data: {
+                    results: [],
+                    total: 0,
+                    page,
+                    per_page,
+                    total_pages: 0,
+                    query: q,
+                    time_taken,
+                    filters,
+                    elasticsearch: true,
+                    cached: searchResults.cached || false
+                }
+            });
         }
 
         const results = searchResults.results.map((result, index) => ({
@@ -202,14 +220,18 @@ router.get('/search', asyncHandler(async (req, res) => {
 
         const time_taken = Date.now() - startTime;
 
+        const inferredTotal = (typeof searchResults.total === 'number' && searchResults.total > results.length)
+            ? searchResults.total
+            : ((page - 1) * per_page + results.length);
+
         const finalResponse = {
             success: true,
             data: {
                 results,
-                total: searchResults.total,
+                total: inferredTotal,
                 page,
                 per_page,
-                total_pages: searchResults.pagination?.total_pages || Math.ceil(searchResults.total / per_page),
+                total_pages: searchResults.pagination?.total_pages || Math.ceil(inferredTotal / per_page),
                 query: q,
                 time_taken,
                 filters,
@@ -241,6 +263,7 @@ router.get('/search', asyncHandler(async (req, res) => {
 
     } catch (error) {
         req.app.locals.logger.error('Elasticsearch search failed, trying MySQL fallback:', error);
+        console.error('Search API Error:', error.message);
         
         // Fallback to MySQL search if Elasticsearch fails
         try {
@@ -305,7 +328,9 @@ router.get('/search', asyncHandler(async (req, res) => {
             req.app.locals.logger.error('MySQL fallback error:', mysqlError);
             res.status(500).json({
                 success: false,
-                error: 'Search service temporarily unavailable'
+                error: 'Search service temporarily unavailable',
+                message: 'Both Elasticsearch and MySQL search services are currently unavailable. Please try again later.',
+                details: process.env.NODE_ENV === 'development' ? mysqlError.message : undefined
             });
         }
     }
@@ -944,20 +969,37 @@ router.get('/image-proxy', asyncHandler(async (req, res) => {
             }
         });
         
-        // Check if response is actually an image
-        const contentType = response.headers['content-type'];
-        if (!contentType || !contentType.startsWith('image/')) {
-            console.warn('⚠️ Image proxy: Non-image content type:', contentType, 'for URL:', url);
-            return res.status(400).json({ 
-                error: 'URL does not point to an image',
-                contentType: contentType,
-                url: url
-            });
+        // Determine mime: some servers incorrectly return application/octet-stream for images
+        const headerContentType = response.headers['content-type'];
+        const lowerUrl = String(url).toLowerCase();
+        const extToMime = (u) => {
+            if (u.endsWith('.webp')) return 'image/webp';
+            if (u.endsWith('.jpg') || u.endsWith('.jpeg')) return 'image/jpeg';
+            if (u.endsWith('.png')) return 'image/png';
+            if (u.endsWith('.gif')) return 'image/gif';
+            if (u.endsWith('.bmp')) return 'image/bmp';
+            if (u.endsWith('.svg')) return 'image/svg+xml';
+            return null;
+        };
+        let resolvedContentType = headerContentType || extToMime(lowerUrl);
+        const looksLikeImageByExt = !!extToMime(lowerUrl);
+        const isImageHeader = resolvedContentType && resolvedContentType.startsWith('image/');
+
+        if (!isImageHeader && looksLikeImageByExt) {
+            // Assume image based on extension when server lies about content-type
+            resolvedContentType = extToMime(lowerUrl);
+        }
+
+        if (!resolvedContentType || !resolvedContentType.startsWith('image/')) {
+            console.warn('⚠️ Image proxy: Non-image content type:', headerContentType, 'for URL:', url);
+            // Soft-fail: serve placeholder instead of 400 to avoid repeated retries
+            const placeholderUrl = `https://via.placeholder.com/200x200?text=Image+Unavailable`;
+            return res.redirect(placeholderUrl);
         }
         
         // Set appropriate headers
         res.set({
-            'Content-Type': contentType,
+            'Content-Type': resolvedContentType,
             'Cache-Control': 'public, max-age=3600', // Cache for 1 hour
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'GET',
@@ -1253,35 +1295,58 @@ router.get('/news', asyncHandler(async (req, res) => {
             }
         });
     } catch (error) {
-        req.app.locals.logger.error('News search failed - using fallback', { error: error.message, query: q });
-        
-        // Return demo news data for development
+        req.app.locals.logger.error('News search failed - applying safe fallback', { error: error.message, query: q });
+
+        // Safe fallback: try general web search and format as news cards
+        try {
+            const elastic_sites = require('../models/elastic_search/site');
+            const webResults = await elastic_sites.get({ q, page, per_page });
+            const time_taken = Date.now() - startTime;
+
+            if (webResults && webResults.success && Array.isArray(webResults.results) && webResults.results.length > 0) {
+                const results = webResults.results.map((hit, index) => ({
+                    id: `news-fallback-${(page - 1) * per_page + index + 1}`,
+                    title: hit.site_data_title,
+                    description: hit.site_data_description,
+                    content: hit.site_data_article || hit.site_data_content,
+                    url: hit.site_data_link,
+                    image: hit.site_data_image,
+                    publishedAt: hit.site_data_last_update || hit.site_data_date,
+                    source: hit.site_title || 'Unknown Source',
+                    author: hit.site_data_author,
+                    category: category || 'General',
+                    readTime: `${Math.ceil((hit.site_data_word_count || 500) / 200)} min read`
+                }));
+
+                return res.json({
+                    success: true,
+                    data: {
+                        results,
+                        total: webResults.total || results.length,
+                        page,
+                        per_page,
+                        query: q,
+                        time_taken,
+                        fallback: true
+                    }
+                });
+            }
+        } catch (secondaryError) {
+            req.app.locals.logger.error('News safe fallback failed', { error: secondaryError.message, query: q });
+        }
+
+        // Final minimal placeholder (only if everything fails)
         const time_taken = Date.now() - startTime;
-        
-        res.json({
+        return res.json({
             success: true,
             data: {
-                results: [
-                    {
-                        id: 'demo-news-1',
-                        title: `Breaking: ${q} in the News`,
-                        description: `This is a demo news article for your search query "${q}". News search requires Elasticsearch integration with news sources.`,
-                        content: `Full article content about ${q} would appear here. This is demo content for development purposes.`,
-                        url: `https://example.com/news/${encodeURIComponent(q)}`,
-                        image: 'https://via.placeholder.com/400x200?text=News+Demo',
-                        publishedAt: new Date().toISOString(),
-                        source: 'Demo News Source',
-                        author: 'Demo Author',
-                        category: category || 'General',
-                        readTime: '3 min read'
-                    }
-                ],
-                total: 1,
+                results: [],
+                total: 0,
                 page,
                 per_page,
                 query: q,
                 time_taken,
-                demo: true
+                fallback: true
             }
         });
     }

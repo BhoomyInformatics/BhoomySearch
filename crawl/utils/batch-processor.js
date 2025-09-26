@@ -10,7 +10,7 @@ class BatchProcessor {
         this.maxRetries = options.maxRetries || 3;
         this.retryDelay = options.retryDelay || 1000; // 1 second
         this.timeoutMs = options.timeoutMs || 30000; // 30 seconds
-        this.concurrencyLimit = options.concurrencyLimit || 5;
+        this.concurrencyLimit = options.concurrencyLimit || 50;
         this.enableMonitoring = options.enableMonitoring !== false;
         
         // Batch statistics

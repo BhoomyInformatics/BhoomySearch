@@ -320,6 +320,28 @@ const get_aggregations = async(req, res) => {
     }
 };
 
+// Get search syntax help for boolean operators
+const get_syntax_help = async(req, res) => {
+    try {
+        const syntaxHelp = elastic_sites.get_syntax_help();
+        
+        res.status(200).json({
+            success: true,
+            data: {
+                syntax_help: syntaxHelp,
+                message: 'Search syntax help retrieved successfully'
+            }
+        });
+    } catch (error) {
+        console.error('Syntax help API error:', error);
+        res.status(500).json({
+            success: false,
+            data: { syntax_help: {} },
+            error: 'Syntax help service temporarily unavailable'
+        });
+    }
+};
+
 module.exports = {
     search,
     get_images,
@@ -327,5 +349,6 @@ module.exports = {
     get_news,
     get_suggestions,
     health_check,
-    get_aggregations
+    get_aggregations,
+    get_syntax_help
 };

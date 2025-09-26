@@ -62,7 +62,7 @@ async function testSpecialSites() {
                 
                 if (result.success) {
                     console.log(`✅ Crawl successful for ${url}`);
-                    console.log(`   📄 New pages indexed: ${result.newPagesIndexed ?? result.indexedToDatabase ?? result.uniquePages}`);
+                    console.log(`   📄 New pages indexed: ${result.uniquePages}`);
                     console.log(`   🔄 Duplicates skipped: ${result.duplicatesSkipped}`);
                     console.log(`   💾 HTTP requests saved: ${result.httpRequestsSaved}`);
                     console.log(`   📊 Efficiency: ${result.crawlEfficiency}%`);

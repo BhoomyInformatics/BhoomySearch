@@ -22,7 +22,7 @@ require('http').globalAgent.keepAliveMsecs = 30000;
 require('https').globalAgent.keepAliveMsecs = 30000;
 
 // Increase max listeners to prevent warnings
-require('events').EventEmitter.defaultMaxListeners = 20;
+require('events').EventEmitter.defaultMaxListeners = 50;
 
 console.log('🔧 Applied SSL and Connection Fixes:');
 console.log('   ✅ Disabled SSL certificate verification (NODE_TLS_REJECT_UNAUTHORIZED=0)');
@@ -63,7 +63,7 @@ require('net').createConnection = function(...args) {
 // Export configuration
 module.exports = {
     sslFixed: true,
-    maxConnections: 15,
+    maxConnections: 20,
     keepAlive: true,
     platform: os.platform(),
     nodeVersion: process.version

@@ -165,9 +165,24 @@ class ContentParser {
                     new URL(url, 'https://example.com');
                     return true; // Valid relative URL
                 } catch (relativeError) {
-                    // Check for basic URL structure (more permissive for Unicode)
-                    const basicUrlPattern = /^(?:https?:\/\/)?[^\s<>"'{}|\\^`\[\]]+$/u; // Added 'u' flag for Unicode support
-                    return basicUrlPattern.test(url);
+                    // More permissive validation for Unicode URLs
+                    // Allow URLs with Unicode characters in the path (like Kannada, Hindi, etc.)
+                    const unicodeUrlPattern = /^(?:https?:\/\/)?[^\s<>"'{}|\\^`\[\]]+$/u;
+                    
+                    // Additional check: if it looks like a valid URL with Unicode path, allow it
+                    if (unicodeUrlPattern.test(url)) {
+                        // Check if it has a valid domain structure
+                        const domainMatch = url.match(/^https?:\/\/([^\/]+)/);
+                        if (domainMatch) {
+                            const domain = domainMatch[1];
+                            // Basic domain validation (allows Unicode in subdomain/path)
+                            if (domain.includes('.') && !domain.includes(' ')) {
+                                return true;
+                            }
+                        }
+                    }
+                    
+                    return false;
                 }
             }
             
@@ -289,7 +304,7 @@ class ContentParser {
                 videos: this.extractVideos($, normalizedUrl),
                 documents: this.extractDocuments($, normalizedUrl),
                 article: this.extractArticleContent($),                
-                icon: this.extractIcon($),
+                icon: this.extractIcon($, normalizedUrl),
                 metadata: this.extractMetadata($),
                 pageType: this.extractPageType($)
             };
@@ -1254,6 +1269,9 @@ class ContentParser {
             // Remove all img tags to prevent malformed attribute extraction
             $clonedElement.find('img').remove();
             
+            // Also remove iframe/noscript and similar non-content containers
+            $clonedElement.find('iframe, noscript').remove();
+            
             // Remove other self-closing tags that might have malformed attributes
             $clonedElement.find('input, meta, link, br, hr').remove();
             
@@ -1274,7 +1292,7 @@ class ContentParser {
     }
 
     
-    extractIcon($) {
+    extractIcon($, baseUrl) {
         try {
             const iconSelectors = [
                 'link[rel="shortcut icon"]',
@@ -1285,7 +1303,7 @@ class ContentParser {
             for (const selector of iconSelectors) {
                 const href = $(selector).attr('href');
                 if (href) {
-                    return href;
+                    return this.sanitizeIconUrl(href, baseUrl);
                 }
             }
 
@@ -1293,6 +1311,40 @@ class ContentParser {
         } catch (error) {
             logger.error('Error extracting icon', error);
             return '';
+        }
+    }
+
+    sanitizeIconUrl(href, baseUrl) {
+        try {
+            // Decode once to expose placeholders
+            let decoded = href;
+            try { decoded = decodeURIComponent(href); } catch (_) {}
+
+            // Remove known placeholders like [BBHOST] or %5BBBHOST%5D
+            decoded = decoded
+                .replace(/\[?BBHOST\]?/gi, '')
+                .replace(/%5B%5BBBHOST%5D/gi, '')
+                .replace(/%5BBBHOST%5D/gi, '')
+                .replace(/\[host\]/gi, '');
+
+            // Resolve relative or protocol-relative URLs
+            let absolute;
+            if (decoded.startsWith('http://') || decoded.startsWith('https://')) {
+                absolute = decoded;
+            } else if (decoded.startsWith('//')) {
+                const b = new URL(baseUrl);
+                absolute = `${b.protocol}${decoded}`;
+            } else {
+                absolute = new URL(decoded, baseUrl).toString();
+            }
+
+            // Final minimal validation
+            if (/\.ico$|\.png$|\.svg$/i.test(absolute)) {
+                return absolute;
+            }
+            return absolute;
+        } catch (e) {
+            return href;
         }
     }
 
@@ -1349,6 +1401,11 @@ class ContentParser {
         
         // Enhanced sanitization to remove CSS style patterns and HTML attributes
         return text
+            // Remove common placeholder texts and leftover UI messages
+            .replace(/\b(loading|please wait|click here|enable javascript to view|processing)\b[:.!\s\-]*/gi, '')
+            .replace(/iframe\s*height\s*=\s*0\s*width\s*=\s*0/gi, '')
+            .replace(/\b(height|width)\s*=\s*0\b/gi, '')
+
             // Remove CSS style patterns that got extracted as text
             .replace(/style=position:absolute[^>]*>/gi, '')
             .replace(/style=[^>]*position:absolute[^>]*>/gi, '')
@@ -1388,7 +1445,7 @@ class ContentParser {
             // General cleanup
             .replace(/[\r\n\t]+/g, ' ')   // Replace line breaks and tabs with spaces
             .replace(/\s+/g, ' ')         // Replace multiple spaces with single space
-            .replace(/['"]/g, '')         // Remove quotes to prevent SQL issues
+            .replace(/["']/g, '')         // Remove quotes to prevent SQL issues
             .replace(/;\s*;+/g, ';')      // Remove multiple semicolons
             .replace(/[;:]+\s*$/, '')     // Remove trailing semicolons/colons
             .trim();                      // Remove leading/trailing whitespace

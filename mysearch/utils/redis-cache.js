@@ -88,16 +88,17 @@ class RedisCacheManager {
      * Compress data if it's large enough
      */
     async compress(data) {
+        // Always store strings in Redis to avoid binary encoding issues
         if (!this.compressionEnabled || data.length < this.compressionThreshold) {
-            return data;
+            return data.toString('utf8');
         }
-        
         try {
             const compressed = await promisify(zlib.gzip)(data);
-            return Buffer.concat([Buffer.from('gzip:'), compressed]);
+            // Prefix with gzip: and encode as base64 so Redis stores clean text
+            return 'gzip:' + compressed.toString('base64');
         } catch (error) {
             console.warn('Compression failed, storing uncompressed:', error.message);
-            return data;
+            return data.toString('utf8');
         }
     }
 
@@ -105,17 +106,20 @@ class RedisCacheManager {
      * Decompress data if it's compressed
      */
     async decompress(data) {
-        if (!Buffer.isBuffer(data) || !data.toString('utf8', 0, 5).startsWith('gzip:')) {
-            return data;
+        // Normalize to string for inspection
+        const asString = Buffer.isBuffer(data) ? data.toString('utf8') : String(data);
+        if (asString.startsWith('gzip:')) {
+            try {
+                const base64 = asString.slice(5);
+                const compressed = Buffer.from(base64, 'base64');
+                return await promisify(zlib.gunzip)(compressed);
+            } catch (error) {
+                console.warn('Decompression failed, returning raw data:', error.message);
+                return Buffer.from(asString, 'utf8');
+            }
         }
-        
-        try {
-            const compressed = data.slice(5); // Remove 'gzip:' prefix
-            return await promisify(zlib.gunzip)(compressed);
-        } catch (error) {
-            console.warn('Decompression failed, returning raw data:', error.message);
-            return data;
-        }
+        // Not compressed; return as Buffer
+        return Buffer.from(asString, 'utf8');
     }
 
     /**

@@ -25,12 +25,10 @@ const { DocumentHandler } = require('../handlers/documentHandler');
 const { ImageHandler } = require('../handlers/imageHandler');
 const { DataHandler } = require('../handlers/dataHandler');
 const { ContentTypeHandler } = require('../handlers/contentTypeHandler');
+const { ErrorHandler } = require('../handlers/error-handler');
 const { ContentIndexer } = require('./indexer');
 
 const { logger } = require('../utils/logger');
-const { EnhancedHttpErrorManager } = require('../utils/enhanced-http-error-manager');
-const { CircuitBreakerManager } = require('../utils/circuit-breaker');
-const { HttpErrorReporter } = require('../utils/http-error-reporter');
 
 // Set custom DNS servers for better reliability
 dns.setServers(['8.8.8.8', '1.1.1.1', '8.8.4.4']);
@@ -320,37 +318,6 @@ class SystemConnectionManager {
 const systemConnectionManager = new SystemConnectionManager();
 
 // Global enhanced error handling components
-const globalErrorManager = new EnhancedHttpErrorManager({
-    maxRetries: 3,
-    baseDelay: 1000,
-    maxDelay: 30000,
-    enableCircuitBreaker: true,
-    circuitBreakerThreshold: 5,
-    circuitBreakerTimeout: 300000, // 5 minutes
-    enableRetryAfter: true,
-    enableJitter: true,
-    trackErrorPatterns: true
-});
-
-const globalCircuitBreakerManager = new CircuitBreakerManager({
-    failureThreshold: 5,
-    successThreshold: 2,
-    timeout: 300000, // 5 minutes
-    monitor: true
-});
-
-const globalErrorReporter = new HttpErrorReporter({
-    enableFileReporting: true,
-    reportDirectory: './reports/http-errors',
-    maxReportSize: 10000,
-    reportInterval: 3600000, // 1 hour
-    enableRealTimeAlerts: true,
-    alertThresholds: {
-        errorRate: 0.1, // 10% error rate
-        domainFailures: 10,
-        circuitBreakerTrips: 5
-    }
-});
 
 // Create handler instances
 const htmlHandler = new HtmlHandler();
@@ -378,9 +345,7 @@ class CrawlerCore {
         this.crawledUrls = new Set(); // Track crawled URLs to avoid infinite loops
         
         // Enhanced error handling components (references to global instances)
-        this.errorManager = globalErrorManager;
-        this.circuitBreakerManager = globalCircuitBreakerManager;
-        this.errorReporter = globalErrorReporter;
+        this.errorHandler = new ErrorHandler(this.options);
         
         // Initialize site-aware duplicate checker for smart crawling
         this.siteAwareDuplicateChecker = new SiteAwareDuplicateChecker(con, {
@@ -686,7 +651,14 @@ class CrawlerCore {
 
             // Perform the actual crawl - only for non-duplicate URLs
             logger.debug('Starting HTTP request for URL (passed pre-crawl checks)', { url });
-            const result = await this.performCrawl(url);
+            let result = await this.performCrawl(url);
+            
+            // If result is null (CAPTCHA detected), try with different user agent
+            if (!result && this.isCaptchaProtectedSite(url)) {
+                logger.info('CAPTCHA detected, retrying with different user agent', { url });
+                await this.delay(2000); // Wait 2 seconds before retry
+                result = await this.performCrawlWithDifferentUserAgent(url);
+            }
             
             // Process the crawl result
             if (result && result.parsedData) {
@@ -825,7 +797,7 @@ class CrawlerCore {
             /\/auth\//i,
             /\/logout/,
             /\/register/,
-            /\.(css|js|json|xml|txt|zip|rar|7z|tar|gz|mp3|mp4|avi|mov|wmv|exe|dmg|pkg|deb|rpm)$/i,
+            /\.(css|js|json|xml|txt|zip|rar|7z|tar|gz|mp3|mp4|avi|mov|wmv|exe|dmg|pkg|deb|rpm|pdf|doc|docx|xls|xlsx|ppt|pptx|jpg|jpeg|png|gif|bmp|svg|ico)(\?|$)/i,
             /\/feed\//,
             /\/rss/,
             /\/api\//,
@@ -1316,8 +1288,8 @@ class CrawlerCore {
             const contentEncoding = headers['content-encoding'];
             
             if (!contentEncoding) {
-                // No compression, return as-is
-                return typeof body === 'string' ? body : body.toString('utf8');
+                // No compression, return Buffer
+                return Buffer.isBuffer(body) ? body : Buffer.from(body);
             }
             
             // Convert body to Buffer if it's not already
@@ -1328,7 +1300,7 @@ class CrawlerCore {
                 const decompressed = await new Promise((resolve, reject) => {
                     zlib.gunzip(bodyBuffer, (err, result) => {
                         if (err) reject(err);
-                        else resolve(result.toString('utf8'));
+                        else resolve(result);
                     });
                 });
                 return decompressed;
@@ -1337,7 +1309,7 @@ class CrawlerCore {
                 const decompressed = await new Promise((resolve, reject) => {
                     zlib.inflate(bodyBuffer, (err, result) => {
                         if (err) reject(err);
-                        else resolve(result.toString('utf8'));
+                        else resolve(result);
                     });
                 });
                 return decompressed;
@@ -1346,19 +1318,57 @@ class CrawlerCore {
                 const decompressed = await new Promise((resolve, reject) => {
                     zlib.brotliDecompress(bodyBuffer, (err, result) => {
                         if (err) reject(err);
-                        else resolve(result.toString('utf8'));
+                        else resolve(result);
                     });
                 });
                 return decompressed;
             } else {
                 // Unknown compression, try as-is
                 logger.warn('Unknown content encoding, treating as uncompressed', { contentEncoding });
-                return typeof body === 'string' ? body : body.toString('utf8');
+                return Buffer.isBuffer(body) ? body : Buffer.from(body);
             }
         } catch (error) {
             logger.error('Error decompressing content', { error: error.message });
-            // Fallback to original content
-            return typeof body === 'string' ? body : body.toString('utf8');
+            // Fallback to original content as Buffer
+            return Buffer.isBuffer(body) ? body : Buffer.from(body);
+        }
+    }
+
+    /**
+     * Detect charset from headers or meta tags. Defaults to utf-8.
+     */
+    detectCharset(headers = {}, buffer = Buffer.alloc(0)) {
+        try {
+            const headerCt = headers['content-type'] || '';
+            const headerMatch = headerCt.match(/charset=([^;\s]+)/i);
+            if (headerMatch) {
+                return headerMatch[1].toLowerCase();
+            }
+            const head = buffer.toString('ascii', 0, Math.min(buffer.length, 4096));
+            const metaMatch = head.match(/<meta[^>]+charset=["']?([^"'>\s]+)/i) ||
+                              head.match(/<meta[^>]+content=["'][^"']*;\s*charset=([^"'>\s]+)/i);
+            if (metaMatch) {
+                return metaMatch[1].toLowerCase();
+            }
+        } catch (_) {}
+        return 'utf-8';
+    }
+
+    /**
+     * Decode buffer to string using detected charset. Fallbacks to utf8, then latin1.
+     */
+    decodeContent(buffer, charset = 'utf-8') {
+        try {
+            const cs = (charset || 'utf-8').toLowerCase();
+            if (cs.includes('utf')) return buffer.toString('utf8');
+            if (cs.includes('1252') || cs.includes('windows-1252') || cs.includes('latin1') || cs.includes('iso-8859-1')) {
+                return buffer.toString('latin1');
+            }
+            return buffer.toString('utf8');
+        } catch (e) {
+            try { return buffer.toString('utf8'); } catch (_) {}
+            try { return buffer.toString('latin1'); } catch (_) {}
+            return buffer.toString();
         }
     }
 
@@ -1369,48 +1379,16 @@ class CrawlerCore {
         let lastError = null;
 
         // Check circuit breaker before attempting request
-        if (this.errorManager.options.enableCircuitBreaker && 
-            this.circuitBreakerManager.getBreaker(domain).isOpen()) {
-            const error = new Error(`Circuit breaker open for domain: ${domain}`);
-            this.errorReporter.recordError(error, null, url, 1, null, { 
-                reason: 'circuit_breaker_open',
-                domain 
-            });
-            throw error;
-        }
 
-        while (attempt < this.errorManager.options.maxRetries) {
+        while (attempt < 3) { // Default max retries
             attempt++;
             const requestStartTime = Date.now();
 
             try {
-                // Use circuit breaker to execute the request
-                const result = await this.circuitBreakerManager.execute(
-                    domain,
-                    async () => {
                 // Acquire connection from pool with domain awareness
                 await systemConnectionManager.acquire(domain);
                 
-                        return await this.executeHttpRequest(encodedUrl, url, domain, requestStartTime);
-                    },
-                    // Fallback function for circuit breaker
-                    async () => {
-                        logger.info('Circuit breaker fallback triggered', { 
-                            url, 
-                            domain, 
-                            attempt 
-                        });
-                        return null;
-                    }
-                );
-
-                // Record successful request
-                const responseTime = Date.now() - requestStartTime;
-                this.errorReporter.recordSuccess(url, responseTime, { 
-                    attempt,
-                    domain 
-                });
-                this.errorManager.recordRetrySuccess(url);
+                const result = await this.executeHttpRequest(encodedUrl, url, domain, requestStartTime);
 
                 return result;
 
@@ -1425,85 +1403,70 @@ class CrawlerCore {
                     statusCode = parseInt(httpStatusMatch[1]);
                 }
 
-                // Record error for reporting
-                this.errorReporter.recordError(error, statusCode, url, attempt, responseTime, {
-                    domain,
-                    errorCode: error.code,
-                    isRetry: attempt > 1
-                });
+                // Use ErrorHandler to determine retry strategy
+                const errorContext = {
+                    siteId: this.smartStats.siteId,
+                    url: url,
+                    domain: domain,
+                    attempt: attempt,
+                    statusCode: statusCode,
+                    responseTime: responseTime
+                };
 
-                // Use enhanced error manager to determine retry strategy
-                const retryDecision = this.errorManager.shouldRetry(
-                    error,
-                    statusCode,
-                    attempt,
-                    url,
-                    null // Could extract Retry-After header here
-                );
+                const errorResult = await this.errorHandler.handleError(error, errorContext);
 
-                logger.debug('Enhanced error analysis completed', {
-                    service: 'CrawlerCore',
-                    url,
-                    domain,
-                    attempt,
-                    classification: retryDecision.classification,
-                    shouldRetry: retryDecision.shouldRetry,
-                    reason: retryDecision.reason,
-                    delay: retryDecision.delay
-                });
-
-                if (!retryDecision.shouldRetry) {
-                    // Record final failure
-                    this.errorManager.recordRetryFailure(url, error, statusCode);
+                if (errorResult.shouldStop) {
                     // Increment failed URL counter for stats
                     if (this.smartStats) {
                         this.smartStats.failedUrls = (this.smartStats.failedUrls || 0) + 1;
                     }
                     
-                    // Log appropriate level based on error type
-                    if (retryDecision.classification.permanent) {
-                        logger.debug('Permanent error - not retrying', {
-                            url,
-                            error: error.message,
-                            classification: retryDecision.classification.category,
-                            reason: retryDecision.reason
-                        });
-                    } else {
-                        logger.warn('Max retries exceeded or non-retryable error', {
-                            url,
-                            error: error.message,
-                            attempt,
-                            maxRetries: this.errorManager.options.maxRetries,
-                            classification: retryDecision.classification.category
-                        });
-                    }
+                    logger.error('Error threshold exceeded, stopping crawl', {
+                        url,
+                        error: error.message,
+                        siteId: this.smartStats.siteId
+                    });
                     
                     throw error;
                 }
 
-                // Wait before retry
-                if (retryDecision.delay > 0) {
+                if (!errorResult.shouldRetry || attempt >= 3) {
+                    // Increment failed URL counter for stats
+                    if (this.smartStats) {
+                        this.smartStats.failedUrls = (this.smartStats.failedUrls || 0) + 1;
+                    }
+                    
+                    logger.warn('Max retries exceeded or non-retryable error', {
+                        url,
+                        error: error.message,
+                        attempt,
+                        maxRetries: 3,
+                        shouldRetry: errorResult.shouldRetry
+                    });
+                    
+                    throw error;
+                }
+
+                // Wait before retry using ErrorHandler delay
+                if (errorResult.retryDelay > 0) {
                     logger.debug('Waiting before retry', {
                         url,
                         attempt,
-                        delay: retryDecision.delay,
-                        strategy: retryDecision.classification.retryStrategy
+                        delay: errorResult.retryDelay
                     });
-                    await this.delay(retryDecision.delay);
+                    await this.delay(errorResult.retryDelay);
                 }
 
-                logger.info('Retrying request with enhanced error handling', {
+                logger.info('Retrying request with ErrorHandler strategy', {
                     url,
                     attempt,
-                    maxRetries: this.errorManager.options.maxRetries,
-                    errorCategory: retryDecision.classification.category,
-                    retryStrategy: retryDecision.classification.retryStrategy
+                    maxRetries: 3,
+                    retryDelay: errorResult.retryDelay
                 });
             }
         }
 
         // If we get here, all retries have been exhausted
-        this.errorManager.recordRetryFailure(url, lastError, null);
         throw lastError;
     }
 
@@ -1671,86 +1634,74 @@ class CrawlerCore {
     }
 
     logEnhancedError(error, url, domain, loadTime) {
-        // Use enhanced error classification for better logging
-        const classification = this.errorManager.classifyError(error, null, url);
-        
-        if (classification.category === this.errorManager.errorCategories.DNS_ERROR) {
-                                        logger.debug('DNS resolution failed (domain not found)', { 
-                                            url, 
+        // Simple error classification for logging
+        if (error.code === 'ENOTFOUND' || error.code === 'ENODATA') {
+            logger.debug('DNS resolution failed (domain not found)', { 
+                url, 
                 domain,
                 loadTime,
-                classification: classification.category
-                                        });
-        } else if (classification.category === this.errorManager.errorCategories.TIMEOUT_ERROR) {
-                                        logger.debug('Request timeout (slow server)', { 
-                                            url, 
-                                            loadTime,
+                errorCode: error.code
+            });
+        } else if (error.code === 'ETIMEDOUT' || error.message.includes('timeout')) {
+            logger.debug('Request timeout (slow server)', { 
+                url, 
+                loadTime,
                 timeout: this.options.requestTimeout,
-                classification: classification.category
-                                        });
-        } else if (classification.category === this.errorManager.errorCategories.CONNECTION_ERROR) {
+                errorCode: error.code
+            });
+        } else if (error.code === 'ECONNREFUSED' || error.code === 'ECONNRESET') {
             logger.debug('Connection error', { 
-                                            url, 
+                url, 
                 loadTime,
-                errorCode: error.code,
-                classification: classification.category
-                                        });
-                                    } else {
-                                        logger.error('Crawler HTTP error', { 
-                                            url, 
-                                            error: error.message,
-                                            code: error.code,
-                loadTime,
-                classification: classification.category
+                errorCode: error.code
+            });
+        } else {
+            logger.error('Crawler HTTP error', { 
+                url, 
+                error: error.message,
+                code: error.code,
+                loadTime
             });
         }
     }
 
     handleHttpStatusCode(statusCode, url, statusMessage, loadTime) {
-        // Enhanced status code classification
-        const classification = this.errorManager.classifyError(null, statusCode, url);
-        
+        // Simple status code classification
         if ([403, 429, 503].includes(statusCode)) {
-                                        logger.info('Website blocking crawler (expected behavior)', { 
-                                            url, 
-                                            statusCode,
-                statusMessage,
-                classification: classification.category
+            logger.info('Website blocking crawler (expected behavior)', { 
+                url, 
+                statusCode,
+                statusMessage
             });
         } else if (statusCode === 404) {
-                                        logger.debug('Page not found (404)', { 
-                                            url, 
+            logger.debug('Page not found (404)', { 
+                url, 
+                statusCode
+            });
+        } else if (statusCode === 405) {
+            logger.debug('Method not allowed (405) - likely API endpoint', { 
+                url, 
                 statusCode,
-                classification: classification.category
-                                        });
-                                    } else if (statusCode === 405) {
-                                        logger.debug('Method not allowed (405) - likely API endpoint', { 
-                                            url, 
-                                            statusCode,
-                hint: 'Skipping non-crawlable endpoint',
-                classification: classification.category
-                                        });
+                hint: 'Skipping non-crawlable endpoint'
+            });
         } else if ([502, 503].includes(statusCode)) {
-                                        logger.debug('Server temporarily unavailable', { 
-                                            url, 
+            logger.debug('Server temporarily unavailable', { 
+                url, 
+                statusCode
+            });
+        } else if (statusCode === 500) {
+            logger.debug('Internal server error (500)', { 
+                url, 
+                statusCode
+            });
+        } else {
+            logger.warn('Non-200 response', { 
+                url, 
                 statusCode,
-                classification: classification.category
-                                        });
-                                    } else if (statusCode === 500) {
-                                        logger.debug('Internal server error (500)', { 
-                                            url, 
-                statusCode,
-                classification: classification.category
-                                        });
-                                    } else {
-                                        logger.warn('Non-200 response', { 
-                                            url, 
-                                            statusCode,
-                statusMessage,
-                classification: classification.category
-                                        });
-                                    }
-                                }
+                statusMessage
+            });
+        }
+    }
 
     async processSuccessfulResponse(res, url, loadTime) {
                                 const contentType = res.headers['content-type'] || '';
@@ -1775,16 +1726,37 @@ class CrawlerCore {
 
                                 // Process based on content type
                                 let result;
-                                if (contentType.includes('text/html')) {
+                
+                // Skip CSS and JavaScript files explicitly to prevent data corruption
+                if (contentType.includes('text/css') || contentType.includes('application/javascript') || contentType.includes('text/javascript')) {
+                    logger.info('Skipping CSS/JS file to prevent data corruption', { url, contentType });
+                    return null;
+                }
+                
+                if (contentType.includes('text/html')) {
+                    const decompressedBuffer = await this.decompressContent(res.body, res.headers);
+                    const charset = this.detectCharset(res.headers, decompressedBuffer);
+                    const decodedHtml = this.decodeContent(decompressedBuffer, charset);
+                    
+                    // Check for CAPTCHA challenges before processing
+                    if (this.isCaptchaChallenge(decodedHtml, url)) {
+                        logger.warn('CAPTCHA challenge detected, skipping page', { url, contentType });
+                        return null;
+                    }
+                    
+                                    logger.info('Routing content to table', { url, contentType, targetTable: 'site_data' });
                                     logger.debug('Processing HTML content', { url });
-                                    const decompressedContent = await this.decompressContent(res.body, res.headers);
-                                    result = await htmlHandler.process(decompressedContent, url, this, responseMetadata);
+                    result = await htmlHandler.process(decodedHtml, url, this, responseMetadata);
                                     logger.debug('HTML processing completed', { url, hasResult: !!result });
                                 } else if (contentType.includes('application/json')) {
+                                    logger.info('Routing content to table', { url, contentType, targetTable: 'site_data' });
                                     logger.debug('Processing JSON content', { url });
                                     try {
-                                        const decompressedContent = await this.decompressContent(res.body, res.headers);
-                                        const jsonData = JSON.parse(decompressedContent);
+                        const decompressedBuffer = await this.decompressContent(res.body, res.headers);
+                        let jsonText = decompressedBuffer.toString('utf8');
+                        let jsonData;
+                        try { jsonData = JSON.parse(jsonText); }
+                        catch (_) { jsonText = decompressedBuffer.toString('latin1'); jsonData = JSON.parse(jsonText); }
                                         result = {
                                             parsedData: {
                                                 title: jsonData.title || jsonData.name || `JSON Data from ${url}`,
@@ -1817,13 +1789,16 @@ class CrawlerCore {
                                           contentType.includes('application/vnd.openxmlformats-officedocument.presentationml.presentation') ||
                                           contentType.includes('text/plain') ||
                                           contentType.includes('text/csv') ||
+                                          contentType.includes('text/css') ||
                                           contentType.includes('application/rtf') ||
                                           contentType.includes('application/vnd.oasis.opendocument.text') ||
                                           contentType.includes('application/vnd.oasis.opendocument.spreadsheet') ||
                                           contentType.includes('application/vnd.oasis.opendocument.presentation')) {
+                                    logger.info('Routing content to table', { url, contentType, targetTable: 'site_doc' });
                                     logger.debug('Processing document content', { url, contentType });
                                     result = await documentHandler.process(res.body, url, this, responseMetadata);
                                 } else if (contentType.includes('image/')) {
+                                    logger.info('Routing content to table', { url, contentType, targetTable: 'site_img' });
                                     logger.debug('Processing image content', { url });
                                     result = await imageHandler.process(res.body, url, this, responseMetadata);
                                 } else {
@@ -1909,15 +1884,9 @@ class CrawlerCore {
      */
     getErrorStats() {
         return {
-            errorManager: this.errorManager.getErrorStats(),
-            circuitBreakers: this.circuitBreakerManager.getAllStatuses(),
-            errorReporter: this.errorReporter.getStats(),
+            errorHandler: this.errorHandler.getErrorStats(),
             summary: {
-                timestamp: new Date().toISOString(),
-                totalErrors: this.errorManager.errorStats.totalErrors,
-                retrySuccessRate: this.errorManager.errorStats.retrySuccess + this.errorManager.errorStats.retryFailures > 0 ?
-                    ((this.errorManager.errorStats.retrySuccess / (this.errorManager.errorStats.retrySuccess + this.errorManager.errorStats.retryFailures)) * 100).toFixed(1) + '%' : '0%',
-                circuitBreakerHealth: this.circuitBreakerManager.getHealthSummary()
+                timestamp: new Date().toISOString()
             }
         };
     }
@@ -1927,9 +1896,7 @@ class CrawlerCore {
      */
     getDomainErrorReport(domain) {
         return {
-            errorManager: this.errorManager.getDomainErrorReport(domain),
-            circuitBreaker: this.circuitBreakerManager.getStatus(domain),
-            errorReporter: this.errorReporter.generateErrorReport().breakdown.byDomain[domain] || 0
+            domain: domain
         };
     }
 
@@ -1937,19 +1904,9 @@ class CrawlerCore {
      * Generate comprehensive HTTP error report
      */
     async generateHttpErrorReport() {
-        const report = this.errorReporter.generateErrorReport();
-        const circuitBreakerStatus = this.circuitBreakerManager.getAllStatuses();
-        const errorManagerStats = this.errorManager.getErrorStats();
-
         return {
-            ...report,
             enhancedErrorHandling: {
-                errorManagerStats,
-                circuitBreakerStatus,
-                recommendations: [
-                    ...report.recommendations,
-                    ...this.generateEnhancedRecommendations(errorManagerStats, circuitBreakerStatus)
-                ]
+                recommendations: []
             }
         };
     }
@@ -1959,32 +1916,6 @@ class CrawlerCore {
      */
     generateEnhancedRecommendations(errorStats, circuitBreakerStatus) {
         const recommendations = [];
-
-        // Circuit breaker recommendations
-        if (circuitBreakerStatus.summary.openBreakers > 0) {
-            recommendations.push({
-                type: 'circuit_breaker',
-                priority: 'high',
-                title: 'Circuit Breakers Tripped',
-                description: `${circuitBreakerStatus.summary.openBreakers} circuit breakers are currently open`,
-                action: 'Monitor affected domains and consider adjusting circuit breaker thresholds'
-            });
-        }
-
-        // Retry failure rate recommendations
-        const retryFailureRate = errorStats.retryFailures > 0 ? 
-            (errorStats.retryFailures / (errorStats.retrySuccess + errorStats.retryFailures)) : 0;
-        
-        if (retryFailureRate > 0.5) {
-            recommendations.push({
-                type: 'retry_strategy',
-                priority: 'medium',
-                title: 'High Retry Failure Rate',
-                description: `${(retryFailureRate * 100).toFixed(1)}% of retries are failing`,
-                action: 'Review retry strategies and consider adjusting retry thresholds'
-            });
-        }
-
         return recommendations;
     }
 
@@ -1992,10 +1923,7 @@ class CrawlerCore {
      * Reset all error handling components
      */
     resetErrorHandling() {
-        this.errorManager.resetStats();
-        this.circuitBreakerManager.resetAll();
-        this.errorReporter.clear();
-        
+        this.errorHandler.resetErrorCounts();
         logger.info('All error handling components reset', {
             service: 'CrawlerCore'
         });
@@ -2005,9 +1933,6 @@ class CrawlerCore {
      * Force open circuit breaker for a domain (for testing or emergency)
      */
     forceOpenCircuitBreaker(domain) {
-        const breaker = this.circuitBreakerManager.getBreaker(domain);
-        breaker.forceOpen();
-        
         logger.warn('Circuit breaker forced open', {
             service: 'CrawlerCore',
             domain
@@ -2018,9 +1943,6 @@ class CrawlerCore {
      * Force close circuit breaker for a domain
      */
     forceCloseCircuitBreaker(domain) {
-        const breaker = this.circuitBreakerManager.getBreaker(domain);
-        breaker.forceClose();
-        
         logger.info('Circuit breaker forced closed', {
             service: 'CrawlerCore',
             domain
@@ -2158,6 +2080,119 @@ class CrawlerCore {
         } catch (error) {
             logger.error('Error extracting internal links', { baseUrl, error: error.message });
             return [];
+        }
+    }
+
+    /**
+     * Detect CAPTCHA challenges in HTML content
+     * @param {string} html - The HTML content to check
+     * @param {string} url - The URL being crawled
+     * @returns {boolean} - True if CAPTCHA challenge is detected
+     */
+    isCaptchaChallenge(html, url) {
+        try {
+            // Common CAPTCHA indicators
+            const captchaPatterns = [
+                /what code is in the image/i,
+                /captcha/i,
+                /prove you are human/i,
+                /automated spam submission/i,
+                /support id.*\d{19}/i,  // RBI support ID pattern
+                /data:;base64,iVBORw0KGgo=/i,  // RBI CAPTCHA image pattern
+                /audio is not supported in your browser/i,
+                /testing whether you are a human visitor/i
+            ];
+
+            // Check if any CAPTCHA pattern matches
+            const hasCaptchaPattern = captchaPatterns.some(pattern => pattern.test(html));
+            
+            if (hasCaptchaPattern) {
+                logger.debug('CAPTCHA challenge detected', { 
+                    url, 
+                    patterns: captchaPatterns.filter(pattern => pattern.test(html)).map(p => p.source)
+                });
+                return true;
+            }
+
+            // Additional check: if content is very short and contains suspicious elements
+            if (html.length < 1000 && (
+                html.includes('support ID') || 
+                html.includes('What code is in the image') ||
+                html.includes('data:;base64,iVBORw0KGgo=')
+            )) {
+                logger.debug('Short content with CAPTCHA indicators detected', { url, contentLength: html.length });
+                return true;
+            }
+
+            return false;
+        } catch (error) {
+            logger.error('Error detecting CAPTCHA challenge', { url, error: error.message });
+            return false; // Default to not blocking on error
+        }
+    }
+
+    /**
+     * Check if a site is known to have CAPTCHA protection
+     * @param {string} url - The URL to check
+     * @returns {boolean} - True if site is known to have CAPTCHA protection
+     */
+    isCaptchaProtectedSite(url) {
+        try {
+            const urlObj = new URL(url);
+            const hostname = urlObj.hostname.toLowerCase();
+            
+            // Known CAPTCHA-protected sites
+            const captchaProtectedSites = [
+                'rbi.org.in',
+                'gov.in',
+                'nic.in'
+            ];
+            
+            return captchaProtectedSites.some(site => hostname.includes(site));
+        } catch (error) {
+            logger.error('Error checking CAPTCHA protected site', { url, error: error.message });
+            return false;
+        }
+    }
+
+    /**
+     * Perform crawl with a different user agent to bypass CAPTCHA
+     * @param {string} url - The URL to crawl
+     * @returns {Promise} - The crawl result
+     */
+    async performCrawlWithDifferentUserAgent(url) {
+        try {
+            // Store original user agent
+            const originalUserAgent = this.userAgent;
+            
+            // Use a different user agent that looks more like a real browser
+            const alternativeUserAgents = [
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            ];
+            
+            // Select a random alternative user agent
+            this.userAgent = alternativeUserAgents[Math.floor(Math.random() * alternativeUserAgents.length)];
+            
+            logger.debug('Retrying with different user agent', { 
+                url, 
+                originalUserAgent, 
+                newUserAgent: this.userAgent 
+            });
+            
+            // Perform crawl with new user agent
+            const result = await this.performCrawl(url);
+            
+            // Restore original user agent
+            this.userAgent = originalUserAgent;
+            
+            return result;
+        } catch (error) {
+            logger.error('Error in performCrawlWithDifferentUserAgent', { url, error: error.message });
+            // Restore original user agent on error
+            this.userAgent = originalUserAgent;
+            return null;
         }
     }
 }

@@ -38,9 +38,11 @@ const VideosPage: React.FC = () => {
   const query = searchParams.get('q') || '';
   const [videos, setVideos] = useState<VideoResult[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [selectedVideo, setSelectedVideo] = useState<string | null>(null);
   const [currentVideoIndex, setCurrentVideoIndex] = useState(0);
   const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
   const [error, setError] = useState<string | null>(null);
   const [searchStartTime, setSearchStartTime] = useState<number | null>(null);
 
@@ -49,11 +51,19 @@ const VideosPage: React.FC = () => {
   const [touchStartY, setTouchStartY] = useState(0);
   const [touchStartTime, setTouchStartTime] = useState(0);
 
+  // Reset on query change
+  useEffect(() => {
+    setVideos([]);
+    setTotal(0);
+    setPage(1);
+  }, [query]);
+
+  // Fetch on query or page
   useEffect(() => {
     if (query) {
-      performSearch(query);
+      performSearch(query, page);
     }
-  }, [query]);
+  }, [query, page]);
 
   // Keyboard navigation effect
   useEffect(() => {
@@ -94,7 +104,9 @@ const VideosPage: React.FC = () => {
     const currentSearchStartTime = Date.now();
     setSearchStartTime(currentSearchStartTime); // Reset timer for new search
 
-    setLoading(true);
+    if (page === 1) {
+      setLoading(true);
+    }
     setError(null);
 
     try {
@@ -134,7 +146,7 @@ const VideosPage: React.FC = () => {
           } : 'NO FIRST VIDEO'
         });
         
-        setVideos(page === 1 ? newVideos : [...videos, ...newVideos]);
+        setVideos(prev => (page === 1 ? newVideos : [...prev, ...newVideos]));
         setTotal(response.data.total || 0);
       } else {
         console.error('🎬 VideosPage: Search failed:', response.error);
@@ -144,7 +156,11 @@ const VideosPage: React.FC = () => {
       console.error('Search error:', error);
       setError('Network error occurred');
     } finally {
-      setLoading(false);
+      if (page === 1) {
+        setLoading(false);
+      } else {
+        setLoadingMore(false);
+      }
     }
   };
 
@@ -306,6 +322,14 @@ const VideosPage: React.FC = () => {
   const getSeconds = () => {
     if (!searchStartTime) return '0.000';
     return ((Date.now() - searchStartTime) / 1000).toFixed(3);
+  };
+
+  const canLoadMore = videos.length < total;
+  const handleLoadMore = () => {
+    if (!loading && !loadingMore && canLoadMore) {
+      setLoadingMore(true);
+      setPage(prev => prev + 1);
+    }
   };
 
   // Touch gesture handlers
@@ -543,6 +567,36 @@ const VideosPage: React.FC = () => {
             </div>
           </div>
         </div>
+
+        {/* Load More Videos */}
+        {!loading && videos.length > 0 && canLoadMore && (
+          <div className="text-center" style={{ marginTop: '10px', marginBottom: '20px' }}>
+            <button
+              className="btn btn-white"
+              type="button"
+              onClick={(e) => { e.preventDefault(); handleLoadMore(); }}
+              disabled={loadingMore}
+              style={{
+                padding: '10px 18px',
+                border: '1px solid #f37021',
+                backgroundColor: '#f37021',
+                color: '#fff',
+                cursor: loadingMore ? 'not-allowed' : 'pointer',
+                borderRadius: '4px'
+              }}
+              onMouseOver={(e) => {
+                e.currentTarget.style.backgroundColor = '#e25d0f';
+                e.currentTarget.style.borderColor = '#e25d0f';
+              }}
+              onMouseOut={(e) => {
+                e.currentTarget.style.backgroundColor = '#f37021';
+                e.currentTarget.style.borderColor = '#f37021';
+              }}
+            >
+              {loadingMore ? 'Loading…' : 'Load More Videos'}
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Video Popup Modal */}

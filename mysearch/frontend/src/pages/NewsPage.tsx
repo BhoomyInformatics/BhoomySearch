@@ -28,13 +28,21 @@ const NewsPage: React.FC = () => {
   const query = searchParams.get('q') || '';
   const [news, setNews] = useState<NewsResult[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [searchStartTime, setSearchStartTime] = useState<number | null>(null);
 
+  // Reset results when the query changes
+  useEffect(() => {
+    setPage(1);
+    setNews([]);
+    setTotal(0);
+  }, [query]);
+
   useEffect(() => {
     if (query) {
-      performSearch(query);
+      performSearch(query, page);
     }
   }, [query, page]);
 
@@ -46,7 +54,9 @@ const NewsPage: React.FC = () => {
     const currentSearchStartTime = Date.now();
     setSearchStartTime(currentSearchStartTime); // Reset timer for new search
 
-    setLoading(true);
+    if (page === 1) {
+      setLoading(true);
+    }
 
     try {
       const response = await apiClient.searchNews(searchQuery, page, 20); // Limit to 20 news articles per page
@@ -87,14 +97,18 @@ const NewsPage: React.FC = () => {
           } : 'NO FIRST ARTICLE'
         });
         
-        setNews(page === 1 ? newArticles : [...news, ...newArticles]);
+        setNews((prev) => (page === 1 ? newArticles : [...prev, ...newArticles]));
         setTotal(response.data.total || 0);
         setPage(page);
       }
     } catch (error) {
       console.error('Search error:', error);
     } finally {
-      setLoading(false);
+      if (page === 1) {
+        setLoading(false);
+      } else {
+        setLoadingMore(false);
+      }
     }
   };
 
@@ -103,16 +117,13 @@ const NewsPage: React.FC = () => {
     return ((Date.now() - searchStartTime) / 1000).toFixed(3);
   };
 
-  const generatePagination = () => {
-    const totalPages = Math.ceil(total / 15);
-    const pagination = [];
-    const startPage = Math.max(1, page - 2);
-    const endPage = Math.min(totalPages, page + 2);
-    
-    for (let i = startPage; i <= endPage; i++) {
-      pagination.push(i);
+  // Load-more UX; we still keep page state for backend paging
+  const canLoadMore = news.length < total;
+  const handleLoadMore = () => {
+    if (!loading && !loadingMore) {
+      setLoadingMore(true);
+      setPage(prev => prev + 1);
     }
-    return pagination;
   };
 
   const truncateText = (text: string, length: number) => {
@@ -299,62 +310,33 @@ const NewsPage: React.FC = () => {
                       ))
                     )}
 
-                    {/* Pagination */}
-                    {!loading && news.length > 0 && (
+                    {/* Load More */}
+                    {!loading && news.length > 0 && canLoadMore && (
                       <div className="text-center" style={{ marginTop: '30px' }}>
-                        <div className="btn-group" style={{ display: 'inline-flex', gap: '5px' }}>
-                          {page > 1 && (
-                            <button 
-                              className="btn btn-white pull-left" 
-                              type="button"
-                              onClick={() => setPage(1)}
-                              style={{
-                                padding: '8px 12px',
-                                border: '1px solid #ddd',
-                                backgroundColor: '#fff',
-                                cursor: 'pointer',
-                                borderRadius: '4px'
-                              }}
-                            >
-                              <i className="fa fa-chevron-left">‹</i>
-                            </button>
-                          )}
-
-                          {generatePagination().map((pageNum) => (
-                            <button
-                              key={pageNum}
-                              className={`btn btn-white ${page === pageNum ? 'active' : ''}`}
-                              onClick={() => setPage(pageNum)}
-                              style={{
-                                padding: '8px 12px',
-                                border: '1px solid #ddd',
-                                backgroundColor: page === pageNum ? '#007bff' : '#fff',
-                                color: page === pageNum ? '#fff' : '#333',
-                                cursor: 'pointer',
-                                borderRadius: '4px'
-                              }}
-                            >
-                              {pageNum}
-                            </button>
-                          ))}
-
-                          {page < Math.ceil(total / 15) && (
-                            <button 
-                              className="btn btn-white" 
-                              type="button"
-                              onClick={() => setPage(page + 1)}
-                              style={{
-                                padding: '8px 12px',
-                                border: '1px solid #ddd',
-                                backgroundColor: '#fff',
-                                cursor: 'pointer',
-                                borderRadius: '4px'
-                              }}
-                            >
-                              <i className="fa fa-chevron-right">›</i>
-                            </button>
-                          )}
-                        </div>
+                        <button
+                          className="btn btn-white"
+                          type="button"
+                          onClick={(e) => { e.preventDefault(); handleLoadMore(); }}
+                          disabled={loadingMore}
+                          style={{
+                            padding: '10px 18px',
+                            border: '1px solid #f37021',
+                            backgroundColor: '#f37021',
+                            color: '#fff',
+                            cursor: loadingMore ? 'not-allowed' : 'pointer',
+                            borderRadius: '4px'
+                          }}
+                          onMouseOver={(e) => {
+                            e.currentTarget.style.backgroundColor = '#e25d0f';
+                            e.currentTarget.style.borderColor = '#e25d0f';
+                          }}
+                          onMouseOut={(e) => {
+                            e.currentTarget.style.backgroundColor = '#f37021';
+                            e.currentTarget.style.borderColor = '#f37021';
+                          }}
+                        >
+                          {loadingMore ? 'Loading…' : 'Load More News'}
+                        </button>
                       </div>
                     )}
                   </div>

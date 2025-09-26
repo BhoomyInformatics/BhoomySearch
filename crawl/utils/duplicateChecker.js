@@ -146,7 +146,8 @@ class DuplicateChecker {
             ];
             
             const pathname = urlObj.pathname.toLowerCase();
-            if (skipExtensions.some(ext => pathname.endsWith(ext))) {
+            // Check if URL ends with any of the skip extensions (with or without query parameters)
+            if (skipExtensions.some(ext => pathname.endsWith(ext) || url.toLowerCase().includes(ext + '?'))) {
                 return false;
             }
 
@@ -747,30 +748,14 @@ class DuplicateChecker {
                 `CREATE INDEX IF NOT EXISTS idx_status ON site_data (status)`
             ];
 
-            // Disable automatic index creation by default to avoid permission errors on shared hosts
-            const autoIndexEnabled = process.env.DB_ENABLE_AUTO_INDEX === 'true';
-            if (!autoIndexEnabled) {
-                logger.info('Automatic index creation is disabled (using existing DB indexes). Set DB_ENABLE_AUTO_INDEX=true to enable.');
-            } else {
-                for (const query of indexQueries) {
-                    try {
-                        await this.dbConnection.query(query);
-                        logger.debug('Database index created/verified');
-                    } catch (indexError) {
-                        // Check if it's a permission error
-                        if (indexError.code === 'ER_TABLEACCESS_DENIED_ERROR' || 
-                            (indexError.message && indexError.message.includes('INDEX command denied'))) {
-                            logger.warn('Index creation skipped due to insufficient permissions', { 
-                                error: indexError.message,
-                                suggestion: 'Contact database administrator to create indexes manually for better performance'
-                            });
-                            break; // Skip remaining index creation attempts
-                        } else {
-                            logger.warn('Index creation failed (may already exist)', { 
-                                error: indexError.message 
-                            });
-                        }
-                    }
+            for (const query of indexQueries) {
+                try {
+                    await this.dbConnection.query(query);
+                    logger.debug('Database index created/verified');
+                } catch (indexError) {
+                    logger.warn('Index creation failed (may already exist)', { 
+                        error: indexError.message 
+                    });
                 }
             }
 

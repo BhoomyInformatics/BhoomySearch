@@ -211,12 +211,20 @@ export const useSearchStore = create<SearchStore>()(
 
           setError: (error) => {
             console.log('🔍 SearchStore: Setting error:', error);
-            set({ 
-              error, 
-              loading: false,
-              results: [],
-              total: 0
-            });
+            // Do not clear results when clearing the error (error === null)
+            if (error) {
+              set({ 
+                error, 
+                loading: false,
+                results: [],
+                total: 0
+              });
+            } else {
+              set({
+                error: null,
+                loading: false
+              });
+            }
           },
 
           setCurrentPage: (currentPage) => {

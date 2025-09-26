@@ -113,7 +113,7 @@ const SearchResults = memo<SearchResultsProps>(({ results, loading, onResultClic
   console.log('🔄 SearchResults: Component rendering with', results.length, 'results');
 
   const resultItems = useMemo(() => {
-    if (loading || results.length === 0) return null;
+    if (results.length === 0) return null;
 
     return results.map((result, index) => (
       <SearchResultItem
@@ -123,9 +123,10 @@ const SearchResults = memo<SearchResultsProps>(({ results, loading, onResultClic
         onResultClick={onResultClick}
       />
     ));
-  }, [results, loading, onResultClick]);
+  }, [results, onResultClick]);
 
-  if (loading) {
+  // Only show full-page loader when there are no results yet (initial load)
+  if (loading && results.length === 0) {
     return (
       <div className="flex items-center justify-center py-16">
         <div className="animate-spin w-8 h-8 border-4 border-blue-500 border-t-transparent rounded-full"></div>
@@ -141,6 +142,12 @@ const SearchResults = memo<SearchResultsProps>(({ results, loading, onResultClic
   return (
     <div className="space-y-6 mb-8 search-results-section" style={{ paddingLeft: '25px', paddingRight: '25px' }}>
       {resultItems}
+      {loading && results.length > 0 && (
+        <div className="flex items-center justify-center py-6" aria-live="polite">
+          <div className="animate-spin w-6 h-6 border-4 border-blue-500 border-t-transparent rounded-full"></div>
+          <span className="ml-3 text-gray-600 dark:text-gray-400">Loading more…</span>
+        </div>
+      )}
     </div>
   );
 });

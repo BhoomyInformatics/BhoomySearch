@@ -1,107 +1,40 @@
 const { logger } = require('../utils/logger');
-const { EnhancedImageProcessor } = require('../utils/enhanced-image-processor');
 
 class ImageHandler {
     constructor() {
         this.supportedFormats = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'svg', 'tiff', 'ico'];
         this.maxFileSize = 50 * 1024 * 1024; // 50MB limit
-        
-        // Initialize enhanced image processor
-        this.imageProcessor = new EnhancedImageProcessor({
-            maxWidth: 2048,
-            maxHeight: 2048,
-            quality: 85,
-            maxOriginalSize: this.maxFileSize,
-            maxOptimizedSize: 5 * 1024 * 1024, // 5MB optimized limit
-            enableWebPConversion: true,
-            stripMetadata: true,
-            progressive: true,
-            mozjpeg: true
-        });
     }
 
     async process(imageBuffer, url, crawlerInstance) {
         try {
-            // Skip favicons and small icons which often fail metadata or are not useful
-            const lowerUrl = (url || '').toLowerCase();
-            if (lowerUrl.includes('favicon') || lowerUrl.endsWith('.ico')) {
-                logger.debug('Skipping favicon/ico image', { url });
-                return {
-                    parsedData: null,
-                    extractedLinks: [],
-                    success: false,
-                    skipped: true,
-                    reason: 'favicon/ico'
-                };
-            }
-            logger.info('Processing image content with optimization', { 
+            logger.info('Processing image content', { 
                 url, 
-                originalSize: imageBuffer.length 
+                bufferSize: imageBuffer.length 
             });
 
-            // Basic validation
+            // Check file size
             if (imageBuffer.length > this.maxFileSize) {
                 throw new Error(`Image file too large: ${imageBuffer.length} bytes`);
             }
 
-            // Use enhanced image processor for optimization and quality assessment
-            const processingResult = await this.imageProcessor.processImage(imageBuffer, url);
+            // Extract image metadata
+            const imageData = await this.extractImageData(imageBuffer, url);
             
-            if (!processingResult.success) {
-                logger.warn('Image processing failed quality check', {
-                    url,
-                    reason: processingResult.reason,
-                    issues: processingResult.issues
-                });
-                
-                // For compatibility, fall back to basic processing if optimization fails
-                const fallbackData = await this.extractImageData(imageBuffer, url);
-                crawlerInstance.site_data_db_row = this.mapToDbRow(fallbackData, url);
-                
-                return {
-                    parsedData: fallbackData,
-                    extractedLinks: [],
-                    success: true,
-                    optimized: false,
-                    fallback: true
-                };
-            }
+            // Map to database row format
+            crawlerInstance.site_data_db_row = this.mapToDbRow(imageData, url);
 
-            // Create enhanced image data combining original and optimized info
-            const enhancedImageData = await this.createEnhancedImageData(
-                processingResult.original,
-                processingResult.optimized,
-                processingResult.qualityAssessment,
-                url
-            );
-            
-            // Map to database row format with enhanced data
-            crawlerInstance.site_data_db_row = this.mapToDbRow(enhancedImageData, url);
-
-            // Store optimized image buffer for potential use in indexing
-            crawlerInstance.optimizedImageBuffer = processingResult.optimized.buffer;
-            crawlerInstance.processingResult = processingResult;
-
-            logger.info('Enhanced image processing completed', { 
+            logger.info('Image processing completed', { 
                 url,
-                originalFormat: processingResult.original.format,
-                optimizedFormat: processingResult.optimized.format,
-                originalSize: processingResult.original.size,
-                optimizedSize: processingResult.optimized.size,
-                compressionRatio: (processingResult.optimized.compressionRatio * 100).toFixed(2) + '%',
-                qualityScore: processingResult.qualityAssessment.score,
-                processingTime: processingResult.processingTime + 'ms'
+                format: imageData.format,
+                dimensions: `${imageData.width}x${imageData.height}`,
+                fileSize: imageData.fileSize
             });
 
             return {
-                parsedData: enhancedImageData,
+                parsedData: imageData,
                 extractedLinks: [], // Images don't have crawlable links
-                success: true,
-                optimized: true,
-                originalSize: processingResult.original.size,
-                optimizedSize: processingResult.optimized.size,
-                compressionRatio: processingResult.optimized.compressionRatio,
-                qualityScore: processingResult.qualityAssessment.score
+                success: true
             };
         } catch (error) {
             logger.error('Error processing image content', { 
@@ -109,125 +42,6 @@ class ImageHandler {
                 error: error.message,
                 stack: error.stack 
             });
-            
-            // For critical errors, attempt basic fallback processing
-            try {
-                const fallbackData = await this.extractImageData(imageBuffer, url);
-                crawlerInstance.site_data_db_row = this.mapToDbRow(fallbackData, url);
-                
-                return {
-                    parsedData: fallbackData,
-                    extractedLinks: [],
-                    success: true,
-                    optimized: false,
-                    fallback: true,
-                    error: error.message
-                };
-            } catch (fallbackError) {
-                logger.error('Fallback image processing also failed', {
-                    url,
-                    originalError: error.message,
-                    fallbackError: fallbackError.message
-                });
-                throw error;
-            }
-        }
-    }
-
-    /**
-     * Create enhanced image data combining original and optimized information
-     */
-    async createEnhancedImageData(originalInfo, optimizedInfo, qualityAssessment, url) {
-        try {
-            const urlInfo = this.extractUrlInfo(url);
-            
-            // Create comprehensive metadata combining all information
-            const enhancedMetadata = {
-                // Original image properties
-                original: {
-                    format: originalInfo.format,
-                    fileSize: originalInfo.size,
-                    width: originalInfo.width,
-                    height: originalInfo.height,
-                    aspectRatio: originalInfo.aspectRatio,
-                    megapixels: originalInfo.megapixels,
-                    hasAlpha: originalInfo.hasAlpha,
-                    isAnimated: originalInfo.isAnimated,
-                    density: originalInfo.density,
-                    channels: originalInfo.channels,
-                    depth: originalInfo.depth
-                },
-                
-                // Optimized image properties
-                optimized: {
-                    format: optimizedInfo.format,
-                    fileSize: optimizedInfo.size,
-                    width: optimizedInfo.width,
-                    height: optimizedInfo.height,
-                    quality: optimizedInfo.quality,
-                    compressionRatio: optimizedInfo.compressionRatio
-                },
-                
-                // Quality assessment
-                qualityAssessment: {
-                    score: qualityAssessment.score,
-                    suitable: qualityAssessment.suitable,
-                    issues: qualityAssessment.issues,
-                    recommendations: qualityAssessment.recommendations,
-                    metrics: qualityAssessment.metrics
-                },
-                
-                // URL and processing info
-                url: url,
-                filename: urlInfo.filename,
-                extension: urlInfo.extension,
-                domain: urlInfo.domain,
-                extractedAt: new Date().toISOString(),
-                optimized: true,
-                
-                // Performance metrics
-                spaceSavedBytes: originalInfo.size - optimizedInfo.size,
-                spaceSavedPercentage: (optimizedInfo.compressionRatio * 100).toFixed(2),
-                formatConverted: originalInfo.format !== optimizedInfo.format
-            };
-
-            // Use optimized dimensions for display
-            const displayWidth = optimizedInfo.width || originalInfo.width;
-            const displayHeight = optimizedInfo.height || originalInfo.height;
-            const displayFormat = optimizedInfo.format || originalInfo.format;
-            const displaySize = optimizedInfo.size || originalInfo.size;
-
-            return {
-                title: this.generateEnhancedTitle(urlInfo.filename, displayFormat, qualityAssessment),
-                description: this.generateEnhancedDescription(enhancedMetadata),
-                keywords: this.generateEnhancedKeywords(urlInfo, displayFormat, qualityAssessment),
-                content: this.generateEnhancedTextContent(enhancedMetadata),
-                article: this.generateEnhancedTextContent(enhancedMetadata),
-                metadata: enhancedMetadata,
-                documentType: 'image',
-                format: displayFormat,
-                fileSize: displaySize,
-                width: displayWidth,
-                height: displayHeight,
-                links: [],
-                images: [{
-                    url: url,
-                    alt: urlInfo.filename,
-                    title: urlInfo.filename,
-                    width: displayWidth,
-                    height: displayHeight,
-                    format: displayFormat,
-                    fileSize: displaySize,
-                    optimized: true,
-                    originalFormat: originalInfo.format,
-                    originalSize: originalInfo.size,
-                    compressionRatio: optimizedInfo.compressionRatio,
-                    qualityScore: qualityAssessment.score
-                }],
-                videos: []
-            };
-        } catch (error) {
-            logger.error('Error creating enhanced image data', { error: error.message, url });
             throw error;
         }
     }
@@ -550,195 +364,6 @@ class ImageHandler {
         }
     }
 
-    /**
-     * Enhanced title generation with optimization info
-     */
-    generateEnhancedTitle(filename, format, qualityAssessment) {
-        try {
-            // Clean up filename for title
-            let title = filename.replace(/\.[^.]+$/, ''); // Remove extension
-            title = title.replace(/[-_]/g, ' '); // Replace dashes and underscores with spaces
-            title = title.replace(/\b\w/g, l => l.toUpperCase()); // Capitalize words
-            
-            if (title.length < 3) {
-                title = `${format.toUpperCase()} Image`;
-            }
-            
-            // Add quality indicators for high-quality images
-            if (qualityAssessment.score >= 80) {
-                // Don't append quality info to title to keep it clean
-                // title += ' (High Quality)';
-            }
-            
-            return title.substring(0, 255);
-        } catch (error) {
-            logger.error('Error generating enhanced title', { error: error.message });
-            return 'Image';
-        }
-    }
-
-    /**
-     * Enhanced description generation with optimization info
-     */
-    generateEnhancedDescription(metadata) {
-        try {
-            const parts = [];
-            
-            // Basic image info
-            parts.push(`Optimized ${metadata.optimized.format.toUpperCase()} image`);
-            
-            // Dimensions
-            if (metadata.optimized.width && metadata.optimized.height) {
-                parts.push(`${metadata.optimized.width}x${metadata.optimized.height} pixels`);
-            }
-            
-            // Size info with optimization details
-            if (metadata.optimized.fileSize) {
-                const sizeKB = Math.round(metadata.optimized.fileSize / 1024);
-                parts.push(`${sizeKB}KB`);
-                
-                if (metadata.spaceSavedBytes > 0) {
-                    parts.push(`(${metadata.spaceSavedPercentage}% smaller)`);
-                }
-            }
-            
-            // Quality info
-            if (metadata.qualityAssessment.score >= 80) {
-                parts.push('high quality');
-            } else if (metadata.qualityAssessment.score >= 60) {
-                parts.push('good quality');
-            }
-            
-            // Format conversion info
-            if (metadata.formatConverted) {
-                parts.push(`converted from ${metadata.original.format.toUpperCase()}`);
-            }
-            
-            // Additional features
-            if (metadata.original.hasAlpha) {
-                parts.push('with transparency');
-            }
-            
-            if (metadata.original.isAnimated) {
-                parts.push('animated');
-            }
-            
-            return parts.join(', ').substring(0, 500);
-        } catch (error) {
-            logger.error('Error generating enhanced description', { error: error.message });
-            return 'Optimized image file';
-        }
-    }
-
-    /**
-     * Enhanced keywords generation with optimization info
-     */
-    generateEnhancedKeywords(urlInfo, format, qualityAssessment) {
-        try {
-            const keywords = [];
-            
-            // Add format keywords
-            keywords.push(format);
-            keywords.push('image');
-            keywords.push('optimized');
-            
-            // Add quality keywords
-            if (qualityAssessment.score >= 80) {
-                keywords.push('high-quality');
-            } else if (qualityAssessment.score >= 60) {
-                keywords.push('good-quality');
-            }
-            
-            // Add filename-based keywords
-            if (urlInfo.filename) {
-                const filenameParts = urlInfo.filename
-                    .replace(/\.[^.]+$/, '') // Remove extension
-                    .split(/[-_\s]+/) // Split on common separators
-                    .filter(part => part.length > 2); // Filter short parts
-                
-                keywords.push(...filenameParts);
-            }
-            
-            // Add domain-based keywords
-            if (urlInfo.domain) {
-                const domainParts = urlInfo.domain.split('.').filter(part => part !== 'www');
-                keywords.push(...domainParts);
-            }
-            
-            // Add content type keywords based on URL patterns
-            if (qualityAssessment.metrics?.url?.isContent) {
-                keywords.push('content-image');
-            }
-            
-            return [...new Set(keywords)].join(', ').substring(0, 1000);
-        } catch (error) {
-            logger.error('Error generating enhanced keywords', { error: error.message });
-            return format + ', image, optimized';
-        }
-    }
-
-    /**
-     * Enhanced text content generation with optimization info
-     */
-    generateEnhancedTextContent(metadata) {
-        try {
-            const content = [];
-            
-            // Basic info
-            content.push(`Optimized image file: ${metadata.filename || 'unknown'}`);
-            
-            // Original vs optimized comparison
-            content.push(`Original: ${metadata.original.format.toUpperCase()}, ${Math.round(metadata.original.fileSize / 1024)}KB`);
-            content.push(`Optimized: ${metadata.optimized.format.toUpperCase()}, ${Math.round(metadata.optimized.fileSize / 1024)}KB`);
-            
-            if (metadata.spaceSavedBytes > 0) {
-                content.push(`Space saved: ${Math.round(metadata.spaceSavedBytes / 1024)}KB (${metadata.spaceSavedPercentage}%)`);
-            }
-            
-            // Dimensions
-            if (metadata.optimized.width && metadata.optimized.height) {
-                content.push(`Dimensions: ${metadata.optimized.width} x ${metadata.optimized.height} pixels`);
-                
-                if (metadata.original.megapixels) {
-                    content.push(`Resolution: ${metadata.original.megapixels.toFixed(1)} megapixels`);
-                }
-            }
-            
-            // Quality assessment
-            content.push(`Quality score: ${metadata.qualityAssessment.score}/100`);
-            
-            if (metadata.qualityAssessment.issues.length > 0) {
-                content.push(`Quality issues: ${metadata.qualityAssessment.issues.join(', ')}`);
-            }
-            
-            // Technical details
-            if (metadata.original.channels) {
-                content.push(`Color channels: ${metadata.original.channels}`);
-            }
-            
-            if (metadata.original.hasAlpha) {
-                content.push('Transparency: supported');
-            }
-            
-            if (metadata.original.isAnimated) {
-                content.push('Animation: yes');
-            }
-            
-            // Format conversion info
-            if (metadata.formatConverted) {
-                content.push(`Format converted from ${metadata.original.format.toUpperCase()} to ${metadata.optimized.format.toUpperCase()}`);
-            }
-            
-            // Processing timestamp
-            content.push(`Processed: ${metadata.extractedAt}`);
-            
-            return content.join('\n');
-        } catch (error) {
-            logger.error('Error generating enhanced text content', { error: error.message });
-            return 'Optimized image file';
-        }
-    }
-
     mapToDbRow(imageData, url) {
         return {
             site_url: url,
@@ -872,77 +497,6 @@ class ImageHandler {
         } catch (error) {
             logger.error('Error checking if image is content', { error: error.message });
             return true; // Default to including the image
-        }
-    }
-
-    /**
-     * Efficiently filter out base64 and invalid image URLs
-     */
-    isValidImageUrl(url) {
-        return this.imageProcessor.isValidImageUrl(url);
-    }
-
-    /**
-     * Batch process multiple image URLs for efficient filtering
-     */
-    filterValidImageUrls(urls) {
-        try {
-            return urls.filter(url => this.isValidImageUrl(url));
-        } catch (error) {
-            logger.error('Error filtering image URLs', { error: error.message });
-            return urls; // Return original list if filtering fails
-        }
-    }
-
-    /**
-     * Get image processing statistics
-     */
-    getProcessingStats() {
-        return this.imageProcessor.getStats();
-    }
-
-    /**
-     * Reset image processing statistics
-     */
-    resetProcessingStats() {
-        this.imageProcessor.resetStats();
-        logger.info('Image handler processing statistics reset');
-    }
-
-    /**
-     * Configure image processor options
-     */
-    updateProcessorOptions(options) {
-        try {
-            Object.assign(this.imageProcessor.options, options);
-            logger.info('Image processor options updated', { options });
-        } catch (error) {
-            logger.error('Error updating processor options', { error: error.message });
-        }
-    }
-
-    /**
-     * Process multiple images in batch for better performance
-     */
-    async processBatch(imageDataArray, options = {}) {
-        try {
-            logger.info('Starting batch image processing', {
-                count: imageDataArray.length,
-                options
-            });
-
-            const results = await this.imageProcessor.processImageBatch(imageDataArray, options);
-            
-            logger.info('Batch image processing completed', {
-                total: results.length,
-                successful: results.filter(r => r.success).length,
-                failed: results.filter(r => !r.success).length
-            });
-
-            return results;
-        } catch (error) {
-            logger.error('Batch image processing failed', { error: error.message });
-            throw error;
         }
     }
 }

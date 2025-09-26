@@ -4,10 +4,15 @@ const { google } = require('googleapis');
 const { Client } = require('@elastic/elasticsearch');
 const { envManager } = require('../../../config/env-manager');
 const redisCache = require('../../utils/redis-cache');
+const BooleanQueryParser = require('../../utils/booleanQueryParser');
 
 // Fallback memory cache for when Redis is unavailable
 const searchCache = new Map();
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+// Fast query cache for common single-word queries
+const fastQueryCache = new Map();
+const FAST_CACHE_TTL = 2 * 60 * 1000; // 2 minutes for fast queries
 
 // Cache helper functions
 const getCacheKey = (searchParams) => {
@@ -19,7 +24,16 @@ const getCacheKey = (searchParams) => {
     });
 };
 
-const getCachedResult = async (cacheKey) => {
+const getCachedResult = async (cacheKey, searchParams) => {
+    // Check fast cache for single-word queries first
+    if (searchParams.q && searchParams.q.length < 20 && !searchParams.q.includes(' ')) {
+        const fastCached = fastQueryCache.get(cacheKey);
+        if (fastCached && (Date.now() - fastCached.timestamp) < FAST_CACHE_TTL) {
+            console.log('Fast cache hit!');
+            return fastCached.data;
+        }
+    }
+
     // Try Redis first
     try {
         const redisResult = await redisCache.get('search', cacheKey);
@@ -41,10 +55,22 @@ const getCachedResult = async (cacheKey) => {
     return null;
 };
 
-const setCachedResult = async (cacheKey, data) => {
-    // Try Redis first
+const setCachedResult = async (cacheKey, data, searchParams) => {
+    // Set fast cache for single-word queries
+    if (searchParams && searchParams.q && searchParams.q.length < 20 && !searchParams.q.includes(' ')) {
+        if (fastQueryCache.size > 500) {
+            const firstKey = fastQueryCache.keys().next().value;
+            fastQueryCache.delete(firstKey);
+        }
+        fastQueryCache.set(cacheKey, {
+            data: data,
+            timestamp: Date.now()
+        });
+    }
+
+    // Try Redis first with longer TTL for better performance
     try {
-        const success = await redisCache.set('search', cacheKey, data, 300); // 5 minutes TTL
+        const success = await redisCache.set('search', cacheKey, data, 600); // 10 minutes TTL for better cache hit rate
         if (success) {
             return;
         }
@@ -52,8 +78,8 @@ const setCachedResult = async (cacheKey, data) => {
         console.warn('Redis cache set failed, falling back to memory cache:', error.message);
     }
 
-    // Fallback to memory cache
-    if (searchCache.size > 1000) {
+    // Fallback to memory cache with larger size limit
+    if (searchCache.size > 2000) { // Increased cache size
         const firstKey = searchCache.keys().next().value;
         searchCache.delete(firstKey);
     }
@@ -74,9 +100,9 @@ const client = new Client({
         ca: envManager.get('ELASTICSEARCH_CA_CERT'),
         rejectUnauthorized: envManager.getBoolean('ELASTICSEARCH_SSL_VERIFY', false)
     },
-    requestTimeout: envManager.getNumber('ELASTICSEARCH_REQUEST_TIMEOUT', 60000), // Increased from 2s to 60s
-    pingTimeout: envManager.getNumber('ELASTICSEARCH_PING_TIMEOUT', 10000),      // Increased from 1s to 10s
-    maxRetries: envManager.getNumber('ELASTICSEARCH_MAX_RETRIES', 5),            // Increased from 1 to 5
+    requestTimeout: envManager.getNumber('ELASTICSEARCH_REQUEST_TIMEOUT', 1000), // Reduced to 1s for fast response
+    pingTimeout: envManager.getNumber('ELASTICSEARCH_PING_TIMEOUT', 5000),       // Reduced to 5s
+    maxRetries: envManager.getNumber('ELASTICSEARCH_MAX_RETRIES', 2),            // Reduced to 2 for speed
     // Performance optimizations
     compression: 'gzip',
     suggestCompression: true,
@@ -301,75 +327,106 @@ const extractDomain = (query) => {
     return null;
 };
 
-// Build advanced search query with filters
+// Initialize boolean query parser
+const booleanParser = new BooleanQueryParser();
+
+// Build advanced search query with filters and boolean operators
 const buildSearchQuery = (searchParams) => {
     const { q, filters = {} } = searchParams;
     const query = q || "Bhoomy";
     
-    // Check if this is a domain search
-    const domain = extractDomain(query);
+    // Check if this is a boolean query (contains operators)
+    const isBooleanQueryResult = isBooleanQuery(query);
     
-    // Simplified, faster query structure
-    const searchQuery = {
-        bool: {
-            must: [],
-            filter: []
-        }
-    };
+    let searchQuery;
     
-    if (domain) {
-        console.log(`Domain search detected: "${domain}" for query: "${query}"`);
+    if (isBooleanQueryResult) {
+        console.log(`Boolean query detected: "${query}"`);
         
-        // For domain searches, use regular multi_match with high boost on link field
-        searchQuery.bool.must.push({
-            multi_match: {
-                query: query,
-                fields: [
-                    "site_data_link^5",           // Highest boost for link field
-                    "site_data_title^3",           // High boost for title
-                    "site_data_description^2",     // Medium boost for description
-                    "site_data_article^1",         // Low boost for article content
-                    "site_data_content^1"          // Low boost for content
-                ],
-                type: "best_fields",
-                fuzziness: "1",
-                operator: "or"
+        // Use boolean parser for complex queries
+        const parsedQuery = booleanParser.parse(query);
+        searchQuery = parsedQuery.query;
+        
+        // Wrap in bool query if not already a bool query
+        if (!searchQuery.bool) {
+            searchQuery = {
+                bool: {
+                    must: [searchQuery],
+                    filter: []
+                }
+            };
+        } else {
+            // Ensure filter array exists
+            if (!searchQuery.bool.filter) {
+                searchQuery.bool.filter = [];
             }
-        });
+        }
+    } else {
+        // Check if this is a domain search
+        const domain = extractDomain(query);
         
-        // Also search for base domain name (e.g., "vtu" from "vtu.co.in")
-        const baseDomain = domain.split('.')[0];
-        if (baseDomain && baseDomain.length > 2) {
+        // Simplified, faster query structure
+        searchQuery = {
+            bool: {
+                must: [],
+                filter: []
+            }
+        };
+        
+        if (domain) {
+            console.log(`Domain search detected: "${domain}" for query: "${query}"`);
+            
+            // For domain searches, use regular multi_match with high boost on link field
             searchQuery.bool.must.push({
                 multi_match: {
-                    query: baseDomain,
+                    query: query,
                     fields: [
-                        "site_data_link^3",
-                        "site_data_title^2",
-                        "site_data_description^1"
+                        "site_data_link^5",           // Highest boost for link field
+                        "site_data_title^3",           // High boost for title
+                        "site_data_description^2",     // Medium boost for description
+                        "site_data_article^1",         // Low boost for article content
+                        "site_data_content^1"          // Low boost for content
                     ],
                     type: "best_fields",
                     fuzziness: "1",
                     operator: "or"
                 }
             });
-        }
-    } else {
-        // Regular search with optimized multi_match
-        searchQuery.bool.must.push({
-            multi_match: {
-                query: query,
-                fields: [
-                    "site_data_title^3",           // Boost title matches
-                    "site_data_description^2",     // Boost description matches
-                    "site_data_link^1"             // Boost link matches
-                ],
-                type: "best_fields",
-                fuzziness: "0",                     // Disable fuzziness for speed
-                operator: "or",
-                minimum_should_match: "75%"         // Require 75% of terms to match
+            
+            // Also search for base domain name (e.g., "vtu" from "vtu.co.in")
+            const baseDomain = domain.split('.')[0];
+            if (baseDomain && baseDomain.length > 2) {
+                searchQuery.bool.must.push({
+                    multi_match: {
+                        query: baseDomain,
+                        fields: [
+                            "site_data_link^3",
+                            "site_data_title^2",
+                            "site_data_description^1"
+                        ],
+                        type: "best_fields",
+                        fuzziness: "1",
+                        operator: "or"
+                    }
+                });
             }
-        });
+        } else {
+            // Ultra-fast regular search with performance optimizations
+            searchQuery.bool.must.push({
+                multi_match: {
+                    query: query,
+                    fields: [
+                        "site_data_title^3",           // Boost title matches
+                        "site_data_description^2",     // Boost description matches
+                        "site_data_article^1"          // Include article content
+                    ],
+                    type: "best_fields",
+                    fuzziness: "0",                    // Disable fuzziness for speed
+                    operator: "or",
+                    minimum_should_match: "30%"        // Reduced for faster matching
+                }
+            });
+        }
     }
 
     // Only add filters that are actually set for performance
@@ -400,6 +457,56 @@ const buildSearchQuery = (searchParams) => {
     return searchQuery;
 };
 
+// Enhanced helper function to detect boolean queries and advanced search patterns
+const isBooleanQuery = (query) => {
+    if (!query || typeof query !== 'string') return false;
+    
+    // Check for explicit boolean operators (case insensitive)
+    const booleanOperators = /\b(AND|OR|NOT)\b/i;
+    if (booleanOperators.test(query)) return true;
+    
+    // Check for parentheses (grouping)
+    if (query.includes('(') || query.includes(')')) return true;
+    
+    // Check for field:value syntax (title:, body:, author:, site:, intitle:, filetype:)
+    const fieldPattern = /\b(title|body|author|site|intitle|filetype|date|visits|score):/i;
+    if (fieldPattern.test(query)) return true;
+    
+    // Check for quoted phrases
+    if (query.includes('"')) return true;
+    
+    // Check for range operators (>=, <=, >, <, =)
+    const rangeOperators = /[><=]+/;
+    if (rangeOperators.test(query)) return true;
+    
+    // Check for special operators (site:, intitle:, filetype:)
+    const specialOperators = /\b(site|intitle|filetype):/i;
+    if (specialOperators.test(query)) return true;
+    
+    // Check for multiple terms that might benefit from boolean logic
+    const terms = query.trim().split(/\s+/);
+    if (terms.length >= 3) {
+        // Only treat as boolean if it contains explicit boolean operators or field syntax
+        // Don't treat natural language questions as boolean queries
+        const hasExplicitOperators = terms.some(term => 
+            /^(AND|OR|NOT)$/i.test(term)
+        );
+        const hasFieldSyntax = terms.some(term => 
+            /^[a-zA-Z_]+:/.test(term)
+        );
+        const hasQuotes = query.includes('"');
+        const hasParentheses = query.includes('(') || query.includes(')');
+        const hasRangeOperators = /[><=]+/.test(query);
+        
+        // Only return true if it has explicit boolean features
+        if (hasExplicitOperators || hasFieldSyntax || hasQuotes || hasParentheses || hasRangeOperators) {
+            return true;
+        }
+    }
+    
+    return false;
+};
+
 // Build sort configuration
 const buildSortConfig = (sortBy) => {
     switch (sortBy) {
@@ -428,7 +535,7 @@ const get = async (searchParams = {}) => {
     
     // Check cache first
     const cacheKey = getCacheKey(searchParams);
-    const cachedResult = await getCachedResult(cacheKey);
+    const cachedResult = await getCachedResult(cacheKey, searchParams);
     if (cachedResult) {
         console.log(`Cache hit! Query served in ${Date.now() - startTime}ms`);
         return {
@@ -457,6 +564,9 @@ const get = async (searchParams = {}) => {
     const from = (page - 1) * perPage;
     
     try {
+        // Fast search mode for common queries
+        const isCommonQuery = searchParams.q && searchParams.q.length < 20 && !searchParams.q.includes(' ');
+        
         // Use simple, fast search query for performance
         const searchQuery = buildSearchQuery(searchParams);
         
@@ -467,14 +577,14 @@ const get = async (searchParams = {}) => {
             console.log('Domain detected:', extractDomain(searchParams.q));
         }
 
-        // Optimized search with performance settings
+        // Ultra-fast search with aggressive performance settings
         const searchResponse = await client.search({
             index: ['site_data'],
             size: perPage,
             from: from,
             query: searchQuery,
             sort: buildSortConfig(searchParams.filters?.sort_by),
-            timeout: '1000ms', // Reduced timeout for faster response
+            timeout: '500ms', // Aggressive timeout for sub-second response
             _source: [
                 "site_data_title",
                 "site_data_description", 
@@ -485,18 +595,32 @@ const get = async (searchParams = {}) => {
                 "site_data_visit",
                 "site_data_last_update"
             ], // Only fetch required fields
-            track_total_hits: true, // Enable for accurate total count
+            track_total_hits: false, // Disable for faster response - we'll estimate
             preference: '_local', // Use local shard for better performance
-            // Performance optimizations
-            batched_reduce_size: 512,
-            max_concurrent_shard_requests: 5,
+            // Aggressive performance optimizations
+            batched_reduce_size: 256, // Reduced for faster response
+            max_concurrent_shard_requests: 3, // Reduced for faster response
             // Disable expensive features
             explain: false,
-            profile: false
+            profile: false,
+            // Additional performance settings
+            terminate_after: 10000, // Stop after 10k matches for speed
+            search_type: 'query_then_fetch' // Faster search type
         });
 
         // Handle different total hits formats
-        const totalHits = searchResponse.hits.total?.value || searchResponse.hits.total || 0;
+        let totalHits = searchResponse.hits.total?.value || searchResponse.hits.total;
+        if (typeof totalHits !== 'number') {
+            // When track_total_hits is false, ES doesn't return a reliable total.
+            // Do a lightweight count query to get an accurate total without changing UI logic.
+            try {
+                const countResponse = await client.count({ index: ['site_data'], query: searchQuery });
+                totalHits = countResponse.count || searchResponse.hits.hits.length;
+            } catch (countErr) {
+                console.warn('Count fallback failed, using page size as total:', countErr?.message);
+                totalHits = searchResponse.hits.hits.length;
+            }
+        }
         console.log(`Query completed in ${Date.now() - startTime}ms. Found ${totalHits} results.`);
         
         // Debug logging for domain searches
@@ -558,7 +682,7 @@ const get = async (searchParams = {}) => {
             query: result.query,
             filters: result.filters,
             cached: false  // This will be overridden when returned from cache
-        });
+        }, searchParams);
 
         return result;
 
@@ -589,7 +713,7 @@ const get_images = async (searchParams = {}) => {
     
     // Check cache first
     const cacheKey = getCacheKey({ ...searchParams, type: 'images' });
-    const cachedResult = await getCachedResult(cacheKey);
+    const cachedResult = await getCachedResult(cacheKey, searchParams);
     if (cachedResult) {
         console.log(`Image cache hit! Query served in ${Date.now() - startTime}ms`);
         return {
@@ -615,7 +739,7 @@ const get_images = async (searchParams = {}) => {
     const from = (page - 1) * perPage;
 
     try {
-        // Optimized search query with better performance
+        // Ultra-fast image search query
         const searchQuery = {
             bool: {
                 must: [
@@ -624,12 +748,12 @@ const get_images = async (searchParams = {}) => {
                             query: searchParams.q || "Bhoomy",
                             fields: [
                                 "site_img_title^3", 
-                                "site_img_alt^2", 
-                                "site_img_link^1"
+                                "site_img_alt^2"
                             ],
                             type: "best_fields",
-                            fuzziness: "0", // Remove fuzziness for speed
-                            operator: "or"
+                            fuzziness: "0",
+                            operator: "or",
+                            minimum_should_match: "30%" // Reduced for faster matching
                         }
                     }
                 ],
@@ -646,16 +770,16 @@ const get_images = async (searchParams = {}) => {
             });
         }
 
-        // Optimized search with performance settings
+        // Ultra-fast image search with aggressive performance settings
         const searchResponse = await client.search({
             index: ['site_img'],
-            size: perPage, // Don't fetch extra - use proper pagination
+            size: perPage,
             from: from,
             query: searchQuery,
             sort: [
                 { "_score": { "order": "desc" } }
             ],
-            timeout: '5s', // Reduced timeout for better performance
+            timeout: '500ms', // Aggressive timeout for sub-second response
             _source: [
                 'site_img_id',
                 'site_img_title',
@@ -665,9 +789,14 @@ const get_images = async (searchParams = {}) => {
                 'site_img_height',
                 'site_img_size',
                 'site_img_source'
-            ], // Only fetch required fields
-            track_total_hits: true, // Enable for accurate total count
-            preference: '_local' // Use local shard for better performance
+            ],
+            track_total_hits: false, // Disable for faster response
+            preference: '_local',
+            // Performance optimizations
+            terminate_after: 5000, // Stop after 5k matches for speed
+            search_type: 'query_then_fetch',
+            batched_reduce_size: 128,
+            max_concurrent_shard_requests: 2
         });
 
         // Process results efficiently
@@ -677,7 +806,17 @@ const get_images = async (searchParams = {}) => {
             score: hit._score
         }));
 
-        const totalHits = searchResponse.hits.total?.value || searchResponse.hits.total || 0;
+        // Accurate total for images: when track_total_hits=false, total may be missing
+        let totalHits = searchResponse.hits.total?.value || searchResponse.hits.total;
+        if (typeof totalHits !== 'number') {
+            try {
+                const countResp = await client.count({ index: ['site_img'], query: searchQuery });
+                totalHits = countResp.count || 0;
+            } catch (e) {
+                console.warn('Image count fallback failed:', e?.message);
+                totalHits = results.length;
+            }
+        }
         const totalPages = Math.ceil(totalHits / perPage);
         const pages = [];
         for (let i = 1; i <= Math.min(totalPages, 10); i++) {
@@ -710,7 +849,7 @@ const get_images = async (searchParams = {}) => {
             total: result.total,
             results: result.results,
             cached: false
-        });
+        }, searchParams);
 
         return result;
 
@@ -1118,12 +1257,18 @@ const get_suggestions = async (query) => {
     }
 };
 
+// Get search syntax help
+const get_syntax_help = () => {
+    return booleanParser.getSyntaxHelp();
+};
+
 module.exports = {
     get,
     get_images,
     get_videos,
     get_news,
     get_suggestions,
+    get_syntax_help,
     checkElasticsearchConnection,
     extractYouTubeVideoId
 };

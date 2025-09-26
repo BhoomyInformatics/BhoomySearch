@@ -50,32 +50,32 @@ const SearchInfo = memo<{
             Search Results for "{query}"
           </h1>
         </div>
-        <button
-          onClick={onToggleFilters}
-          className="flex items-center gap-2 px-4 py-2 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors duration-300"
-        >
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z" />
-          </svg>
-          Filters
-          {activeFilterCount > 0 && (
-            <span className="bg-blue-600 text-white text-xs rounded-full px-2 py-1 min-w-[20px] text-center">
-              {activeFilterCount}
-            </span>
-          )}
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={onToggleFilters}
+            className="flex items-center gap-2 px-4 py-2 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors duration-300"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z" />
+            </svg>
+            Filters
+            {activeFilterCount > 0 && (
+              <span className="bg-blue-600 text-white text-xs rounded-full px-2 py-1 min-w-[20px] text-center">
+                {activeFilterCount}
+              </span>
+            )}
+          </button>
+        </div>
       </div>
       
-      {!loading && (
-        <>
-          <p className="text-gray-600 dark:text-gray-400">
-            Found {total.toLocaleString()} results
-          </p>
-          <div className="small" style={{ fontSize: '12px', color: '#666', marginTop: '5px' }}>
-            Request time (Page generated in {getSeconds()} seconds.)
-          </div>
-        </>
-      )}
+      <>
+        <p className="text-gray-600 dark:text-gray-400">
+          Found {total.toLocaleString()} results
+        </p>
+        <div className="small" style={{ fontSize: '12px', color: '#666', marginTop: '5px', minHeight: '18px' }}>
+          {loading ? 'Loading more results…' : `Request time (Page generated in ${getSeconds()} seconds.)`}
+        </div>
+      </>
     </motion.div>
   );
 });
@@ -134,6 +134,7 @@ const SearchPage: React.FC = () => {
   const [searchStartTime, setSearchStartTime] = useState<number | null>(null);
   const [showFilters, setShowFilters] = useState(false);
   const [localError, setLocalError] = useState<any>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
   
   // Memory monitoring and lifecycle management
   const {
@@ -214,6 +215,10 @@ const SearchPage: React.FC = () => {
   
   // Add abort controller ref for current search
   const currentSearchController = useRef<AbortController | null>(null);
+  const prefetchCacheRef = useRef<{ page: number; results: SearchResult[]; total: number } | null>(null);
+  const prefetchingPageRef = useRef<number | null>(null);
+  const loadMoreTriggerRef = useRef<HTMLDivElement | null>(null);
+  const lastScrollYRef = useRef<number>(0);
 
   // Memoized computed values
   const hasResults = useMemo(() => results.length > 0, [results.length]);
@@ -344,7 +349,9 @@ const SearchPage: React.FC = () => {
     registerEffect(effectName);
     
     try {
-      setLoading(true);
+      if (page === 1) {
+        setLoading(true);
+      }
       setError(null);
       setLocalError(null);
       clearEnhancedError();
@@ -463,6 +470,38 @@ const SearchPage: React.FC = () => {
           setCurrentPage(page);
         }
 
+        // Prefetch next page in background if more results exist
+        const totalSoFar = (page === 1 ? newResults.length : results.length + newResults.length);
+        const hasNext = totalSoFar < resultTotal;
+        if (hasNext && isMounted()) {
+          try {
+            const nextPage = page + 1;
+            if (prefetchingPageRef.current === nextPage) {
+              // already prefetching
+            } else {
+              prefetchingPageRef.current = nextPage;
+              const bgController = new AbortController();
+              enhancedApiClient.search({
+              q: searchQuery,
+              page: nextPage,
+              per_page: 20,
+              filters: customFilters || filters
+            }, { signal: bgController.signal, timeout: 20000, retryCount: 0 })
+            .then((prefetchResp) => {
+              if (prefetchResp.success) {
+                prefetchCacheRef.current = {
+                  page: nextPage,
+                  results: prefetchResp.data?.results || [],
+                  total: prefetchResp.data?.total || resultTotal
+                };
+                console.log('⚡ Prefetched page', nextPage, 'count:', prefetchCacheRef.current.results.length);
+              }
+            })
+            .catch(() => {/* ignore prefetch errors */});
+            }
+          } catch {/* ignore */}
+        }
+
         // Track successful search
         trackUserInteraction('search_success', {
           query: searchQuery.substring(0, 50),
@@ -545,7 +584,7 @@ const SearchPage: React.FC = () => {
       unregisterEffect(effectName);
       
       // Only update loading state if component is still mounted
-      if (isMounted()) {
+      if (isMounted() && page === 1) {
         setLoading(false);
         console.log('🔍 SearchPage: Enhanced search completed, loading set to false');
       }
@@ -624,16 +663,49 @@ const SearchPage: React.FC = () => {
         resultsCount: results.length 
       });
       
+      // If we have prefetch cache for next page, append instantly
+      if (prefetchCacheRef.current && prefetchCacheRef.current.page === currentPage + 1) {
+        const cached = prefetchCacheRef.current;
+        prefetchCacheRef.current = null;
+        const combinedResults = [...results, ...cached.results];
+        setResults(combinedResults, cached.total);
+        setCurrentPage(currentPage + 1);
+        // Trigger prefetch for the next page after instant append
+        setTimeout(() => {
+          if (isMounted()) {
+            const bgController = new AbortController();
+            performSearchWithController(query, currentPage + 2, bgController);
+          }
+        }, 0);
+        return;
+      }
+
       // Create new abort controller for load more
       const loadMoreController = new AbortController();
+      // Preserve current scroll position to prevent jump to top
+      lastScrollYRef.current = window.scrollY || window.pageYOffset || 0;
+      setLoadingMore(true);
       
       executeWithRetry(
         () => performSearchWithController(query, currentPage + 1, loadMoreController),
         { maxAttempts: 2 }
-      ).catch((error: any) => {
+      ).then(() => {
+          // Restore previous scroll position so user stays at the same place
+          if (isMounted()) {
+            try {
+              window.scrollTo({ top: lastScrollYRef.current, behavior: 'auto' });
+            } catch {
+              window.scrollTo(0, lastScrollYRef.current);
+            }
+          }
+        })
+        .catch((error: any) => {
           if (error.name !== 'AbortError' && isMounted()) {
             console.error('📄 Load more failed:', error);
           }
+        })
+        .finally(() => {
+          if (isMounted()) setLoadingMore(false);
         });
     }
   }, [isMounted, loading, query, hasResults, currentPage, results.length, performSearchWithController, executeWithRetry]);
@@ -644,6 +716,7 @@ const SearchPage: React.FC = () => {
     setShowFilters(newShowFilters);
     trackUserInteraction('filters_toggled', { visible: newShowFilters });
   }, [showFilters]);
+
 
   // Handle result clicks with tracking
   const handleResultClick = useCallback((result: SearchResult) => {
@@ -702,6 +775,27 @@ const SearchPage: React.FC = () => {
     };
   }, [addCleanupFunction]);
 
+  // Prefetch-on-viewport using IntersectionObserver
+  useEffect(() => {
+    if (!hasMore) return;
+    const el = loadMoreTriggerRef.current;
+    if (!el) return;
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (entry.isIntersecting) {
+          // Start prefetch for the next page if not already available
+          if (!prefetchCacheRef.current || prefetchCacheRef.current.page !== currentPage + 1) {
+            const controller = new AbortController();
+            performSearchWithController(query, currentPage + 1, controller)
+              .catch(() => {/* ignore */});
+          }
+        }
+      });
+    }, { root: null, rootMargin: '600px 0px 600px 0px', threshold: 0 });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [hasMore, currentPage, query, performSearchWithController]);
+
   return (
     <ErrorBoundary
       enableRetry={true}
@@ -737,6 +831,7 @@ const SearchPage: React.FC = () => {
               onToggleFilters={toggleFilters}
               activeFilterCount={Object.keys(filters).filter(key => filters[key as keyof typeof filters]).length}
             />
+
 
             {/* Filters */}
             {showFilters && (
@@ -800,16 +895,27 @@ const SearchPage: React.FC = () => {
         {/* Search Results */}
             <SearchResults
               results={results}
-              loading={loading}
+              loading={loading || loadingMore}
               onResultClick={handleResultClick}
             />
 
         {/* Load More Button */}
-            <LoadMoreButton
-              onLoadMore={loadMore}
-              loading={loading}
-              hasMore={hasMore}
-            />
+            {hasMore && (
+              <div className="text-center" style={{ minHeight: '60px' }}>
+                <button
+                  type="button"
+                  onClick={(e) => { e.preventDefault(); if (!loading) loadMore(); }}
+                  disabled={loading || loadingMore}
+                  aria-busy={loading || loadingMore}
+                  className="px-8 py-3 bg-blue-600 text-white rounded-lg transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  style={{ opacity: (loading || loadingMore) ? 0.7 : 1, cursor: (loading || loadingMore) ? 'not-allowed' : 'pointer' }}
+                >
+                  {(loading || loadingMore) ? 'Loading…' : 'Load More Results'}
+                </button>
+                {/* Invisible trigger for prefetch-on-viewport */}
+                <div ref={loadMoreTriggerRef} style={{ height: 1, width: 1, margin: 0, padding: 0, opacity: 0 }} />
+              </div>
+            )}
 
             {/* Empty State */}
             {shouldShowEmptyState && (
@@ -848,6 +954,7 @@ const SearchPage: React.FC = () => {
               margin-left: 15px !important;
               margin-right: 15px !important;
             }
+            
           }
           
           @media (max-width: 480px) {
@@ -870,6 +977,7 @@ const SearchPage: React.FC = () => {
               margin-left: 10px !important;
               margin-right: 10px !important;
             }
+            
           }
         `}</style>
       </div>
@@ -877,4 +985,4 @@ const SearchPage: React.FC = () => {
   );      
 };
 
-export default memo(SearchPage); 
+export default SearchPage;

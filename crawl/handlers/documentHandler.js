@@ -221,18 +221,7 @@ class DocumentHandler {
             };
         } catch (error) {
             logger.error('Error processing PDF', { url, error: error.message });
-            // Graceful fallback: index minimal metadata instead of failing entire crawl
-            return {
-                title: this.extractTitle(null, null, url),
-                description: 'PDF could not be fully parsed',
-                keywords: '',
-                content: '',
-                metadata: { documentType: 'pdf', error: error.message },
-                documentType: 'pdf',
-                pages: 0,
-                fileSize: pdfBuffer.length,
-                hash: this.generateHash(pdfBuffer)
-            };
+            throw new Error(`PDF processing failed: ${error.message}`);
         }
     }
 

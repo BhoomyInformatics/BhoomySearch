@@ -28,6 +28,9 @@ router.post("/search/suggestions", SiteController.get_suggestions);
 // Search aggregations for filters
 router.get("/search/aggregations", SiteController.get_aggregations);
 
+// Search syntax help for boolean operators
+router.get("/search/syntax-help", SiteController.get_syntax_help);
+
 // Health check endpoint
 router.get("/health", SiteController.health_check);
 

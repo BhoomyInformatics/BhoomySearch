@@ -27,7 +27,8 @@ class Server {
     constructor() {
         this.sites;
         this.page = 0;
-        this.parPage = 25; // Reduced batch size for full website crawling
+        this.fetchBatchSize = 200; // window size
+        this.subBatchSize = 20;    // sub-batch size
         this.pageNo = 0;
         this.sitesCount = null;
         this.crawlList = [];
@@ -86,35 +87,54 @@ class Server {
                 return;
             }
             
-            if (!this.sitesCount) await this.loadSiteCount();
-
-            if (this.sitesCount === 0) {
-                console.log('No sites to crawl at this time');
-                return;
-            }
-
             // Initialize crawler
             await this.crawler.initialize();
 
-            for (let i = 0; i < Math.ceil(this.sitesCount / this.parPage); i++) {
-                console.log(`Processing batch ${i + 1} of ${Math.ceil(this.sitesCount / this.parPage)}`);
+            let batchNumber = 0;
+            while (true) {
+                batchNumber++;
                 const rows = await con.query(`
-                    SELECT * FROM sites
-                    WHERE (sites.site_url LIKE '%.org%'
-                        OR sites.site_url LIKE '%.net%')
-                        AND sites.site_active = 1
-                        AND sites.site_locked = 0
-                    ORDER BY sites.site_last_crawl_date ASC
-                    LIMIT ${this.parPage * i},${this.parPage};
+                    SELECT site_id, site_url FROM sites
+                    WHERE (site_url LIKE '%.org%'
+                           OR site_url LIKE '%.net%')
+                      AND site_active = 1
+                      AND site_locked = 0
+                    ORDER BY site_last_crawl_date ASC
+                    LIMIT ${this.fetchBatchSize};
                 `);
-                
-                console.log(`Retrieved ${rows ? rows.length : 0} sites for processing`);
-                if (rows && rows.length > 0) {
-                    await this.promissAll(rows);
-                } else {
+
+                const count = rows ? rows.length : 0;
+                if (!rows || count === 0) {
                     console.log('No more sites to process');
                     break;
                 }
+
+                console.log(`Processing window ${batchNumber} — fetched ${count} sites (max ${this.fetchBatchSize})`);
+
+                const ids = rows.map(r => r.site_id).join(',');
+                await con.query(`
+                    UPDATE sites
+                    SET site_locked = 1,
+                        locked_by = '${script_id}',
+                        site_last_crawl_date = '${new Date().toISOString().replace(/T/, ' ').replace(/\..+/, '')}'
+                    WHERE site_id IN (${ids}) AND site_locked = 0;
+                `);
+
+                const lockedRows = await con.query(`
+                    SELECT * FROM sites
+                    WHERE locked_by = '${script_id}' AND site_id IN (${ids})
+                    ORDER BY site_last_crawl_date ASC;
+                `);
+
+                console.log(`Locked ${lockedRows ? lockedRows.length : 0} sites for this window`);
+
+                for (let start = 0; start < lockedRows.length; start += this.subBatchSize) {
+                    const slice = lockedRows.slice(start, start + this.subBatchSize);
+                    console.log(`Processing sub-batch ${Math.floor(start / this.subBatchSize) + 1} of ${Math.ceil(lockedRows.length / this.subBatchSize)} (size ${slice.length})`);
+                    await this.promissAll(slice);
+                }
+
+                await this.unlockSites(lockedRows);
             }
             
             // Cleanup after all crawling is done
@@ -148,7 +168,7 @@ class Server {
                         console.log(`   Message: ${result.message}`);
                     } else {
                         console.log(`✅ Smart crawl completed for ${site.site_url}:`);
-                        console.log(`   📄 New pages indexed: ${result.newPagesIndexed ?? result.indexedToDatabase ?? result.uniquePages}`);
+                        console.log(`   📄 New pages indexed: ${result.uniquePages}`);
                         console.log(`   🔄 Duplicates skipped: ${result.duplicatesSkipped}`);
                         console.log(`   💾 HTTP requests saved: ${result.httpRequestsSaved}`);
                         console.log(`   📊 Efficiency: ${result.crawlEfficiency}%`);
@@ -237,14 +257,14 @@ process.on('exit', handleExit);
 
 const server = new Server();
 
-// Schedule job to run every 6 hours
-const job = schedule.scheduleJob('0 */6 * * *', async () => {
+// Schedule job to run every 12 hours
+const job = schedule.scheduleJob('0 */12 * * *', async () => {
     console.log(`\n=== Starting scheduled crawl for .org domains at ${new Date().toISOString()} ===`);
     await server.crawlerStart();
     console.log(`=== Completed scheduled crawl for .org domains at ${new Date().toISOString()} ===\n`);
 });
 
-console.log('Bhoomy .org crawler started with schedule: every 6 hours');
+console.log('Bhoomy .org crawler started with schedule: every 12 hours');
 console.log(`Script ID: ${script_id}`);
 
 // Run immediately on start

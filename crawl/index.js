@@ -6,17 +6,6 @@
 // CRITICAL: Apply SSL and connection fixes FIRST before any other modules
 require('./utils/fix-ssl-connections');
 
-// Add global error handlers to prevent unhandled rejections
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-    // Don't exit the process, just log the error
-});
-
-process.on('uncaughtException', (error) => {
-    console.error('Uncaught Exception:', error);
-    // Don't exit the process, just log the error
-});
-
 const { CrawlerCore } = require('./core/crawler');
 const { ContentParser } = require('./core/parser');
 const { ContentIndexer } = require('./core/indexer');
@@ -98,16 +87,13 @@ class SearchEngineCrawler {
             
             logger.info('Starting smart URL crawl', { url, siteId });
             
-            // Create enhanced crawler instance for this URL
+            // Create crawler instance for this URL
             const crawler = new CrawlerCore({ site_url: url, site_id: siteId }, this.dbConnection, {
                 ...this.options,
                 ...options
             });
             
-            // Initialize crawler for the site (loads existing URLs)
-            await crawler.initializeForSite(siteId, url);
-            
-            // Perform the crawl with smart duplicate checking
+            // Perform the crawl
             const result = await crawler.crawlPage(url);
             
             logger.debug('Page crawl completed', { 
@@ -582,72 +568,31 @@ class SearchEngineCrawler {
                 maxPagesPerDomain: options.maxPagesPerDomain || this.options.maxPagesPerDomain
             });
             
-            // Create enhanced crawler instance
+            // Create crawler instance
             const crawler = new CrawlerCore({ site_url: rootUrl, site_id: siteId }, this.dbConnection, {
                 ...this.options,
                 ...options
             });
             
-            // STEP 1: Initialize for site (loads existing crawled URLs)
-            const crawlDecision = await crawler.initializeForSite(siteId, rootUrl);
+            // Start with root URL
+            await crawler.addLinksToQueue([rootUrl], siteId);
             
-            if (!crawlDecision.shouldCrawl) {
-                logger.info('Site crawl skipped based on smart analysis', {
-                    siteId,
-                    rootUrl,
-                    reason: crawlDecision.reason,
-                    action: crawlDecision.action
-                });
-                
-                return {
-                    success: true,
-                    totalPages: 0,
-                    uniquePages: 0,
-                    duplicatesSkipped: 0,
-                    httpRequestsSaved: 0,
-                    crawlEfficiency: 100,
-                    indexedToDatabase: 0,
-                    newPagesIndexed: 0,
-                    reason: crawlDecision.reason,
-                    message: 'Site skipped - recently crawled with low new content'
-                };
-            }
-            
-            // STEP 2: Adjust crawling limits based on estimated new URLs
-            const adjustedOptions = {
-                ...options,
-                maxPagesPerDomain: Math.min(
-                    crawlDecision.estimatedNewUrls || options.maxPagesPerDomain || this.options.maxPagesPerDomain,
-                    options.maxPagesPerDomain || this.options.maxPagesPerDomain
-                )
-            };
-            
-            logger.info('Smart crawl parameters adjusted', {
-                siteId,
-                originalMaxPages: options.maxPagesPerDomain || this.options.maxPagesPerDomain,
-                adjustedMaxPages: adjustedOptions.maxPagesPerDomain,
-                estimatedNewUrls: crawlDecision.estimatedNewUrls
-            });
-            
-            // STEP 3: Start with root URL
-            await crawler.addLinksToQueueSmart([rootUrl], siteId);
-            
-            // STEP 4: Process queue with smart filtering
+            // Process queue
             const processResult = await crawler.processQueue(
-                adjustedOptions.maxPagesPerDomain,
-                adjustedOptions.maxDepth || this.options.maxDepth
+                options.maxPagesPerDomain || this.options.maxPagesPerDomain,
+                options.maxDepth || this.options.maxDepth
             );
             
-            // STEP 5: Get comprehensive statistics
+            // Get comprehensive statistics
             const smartStats = crawler.getSmartStats();
             const crawlResults = {
                 success: true,
                 totalPages: processResult.totalProcessed || 0,
-                uniquePages: smartStats.newUrlsFound || 0,
+                uniquePages: smartStats.indexedToDatabase || 0, // Use actual indexed count instead of newUrlsFound
                 duplicatesSkipped: smartStats.duplicatesSkipped || 0,
                 httpRequestsSaved: smartStats.httpRequestsSaved || 0,
                 crawlEfficiency: smartStats.crawlEfficiency || 0,
-                indexedToDatabase: smartStats.indexingSuccess || 0,
+                indexedToDatabase: smartStats.indexedToDatabase || 0,
                 indexingErrors: smartStats.indexingFailures || 0,
                 siteStats: smartStats.siteStats,
                 performanceMetrics: {
@@ -658,31 +603,18 @@ class SearchEngineCrawler {
                 }
             };
             
-            // Backward compatibility: ensure displayed "new pages indexed" reflects actual DB writes
-            crawlResults.newPagesIndexed = crawlResults.indexedToDatabase;
-            
             this.stats.endTime = new Date();
-            
-            // Report success=false if nothing indexed and there were failures
-            const successFlag = (crawlResults.indexedToDatabase > 0) || (crawlResults.uniquePages > 0);
-            
-            // Accumulate by actual indexed count, not discovered URLs
-            if (successFlag) {
-                this.stats.successful += crawlResults.indexedToDatabase;
-            } else {
-                this.stats.failed += 1;
-            }
+            this.stats.successful += crawlResults.uniquePages;
             this.stats.duplicates += crawlResults.duplicatesSkipped;
             this.stats.httpRequestsSaved += crawlResults.httpRequestsSaved;
             
             // Update site-specific statistics
             const siteStats = this.updateSiteStats(siteId, rootUrl, crawlResults);
-
+            
             logger.info('Smart website crawl completed successfully', {
                 siteId,
                 rootUrl,
                 ...crawlResults,
-                success: successFlag,
                 siteStats: {
                     totalCrawls: siteStats.totalCrawls,
                     averageEfficiency: siteStats.averageEfficiency
@@ -704,11 +636,7 @@ class SearchEngineCrawler {
                 error: error.message,
                 totalPages: 0,
                 uniquePages: 0,
-                duplicatesSkipped: 0,
-                httpRequestsSaved: 0,
-                crawlEfficiency: 0,
-                indexedToDatabase: 0,
-                newPagesIndexed: 0
+                duplicatesSkipped: 0
             };
         }
     }

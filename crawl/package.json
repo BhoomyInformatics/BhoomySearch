@@ -31,15 +31,18 @@
     "high-performance": "NODE_ENV=production MAX_CONNECTIONS=300 OPTIMIZE_FOR_CAPACITY=true node index.js",
     "check-system": "node check-system-status.js",
     "monitor": "node -e \"setInterval(() => { const usage = process.memoryUsage(); console.log('Memory:', Math.round(usage.heapUsed/1024/1024), 'MB'); }, 5000);\"",
+    
     "multi-session": "node multi-session-manager.js start",
     "multi-stop": "node multi-session-manager.js stop",
     "multi-status": "node multi-session-manager.js status",
+    
     "crawl-com": "MULTI_SESSION_ENABLED=true SESSION_ID=bhoomy_com node bhoomy_com.js",
     "crawl-in": "MULTI_SESSION_ENABLED=true SESSION_ID=bhoomy_in node bhoomy_in.js",
     "crawl-org": "MULTI_SESSION_ENABLED=true SESSION_ID=bhoomy_org node bhoomy_org.js",
     "crawl-store": "MULTI_SESSION_ENABLED=true SESSION_ID=bhoomy_store node bhoomy_store.js",
     "crawl-news": "MULTI_SESSION_ENABLED=true SESSION_ID=news_site node news_site.js",
     "crawl-special": "MULTI_SESSION_ENABLED=true SESSION_ID=specialsite node specialsite.js",
+    
     "check-database": "node check-database-stats.js",
     "unlock-sites": "node unlocked.js"
   },
@@ -70,7 +73,7 @@
     "mammoth": "^1.8.0",
     "md5": "^2.3.0",
     "mime-types": "^2.1.35",
-    "mysql2": "^3.14.4",
+    "mysql2": "^3.11.3",
     "node-cron": "^3.0.3",
     "node-fetch": "^2.7.0",
     "node-schedule": "^2.1.1",

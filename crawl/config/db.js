@@ -14,8 +14,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-// Check if running on production server by looking for typical server paths
-const isProduction = fs.existsSync('/home/searchengine') || process.env.NODE_ENV === 'production';
+// Import centralized environment detection
+const { isProduction } = require('./environment');
 
 /**
  * Get system information for database optimization
@@ -82,22 +82,24 @@ const dbConfig = {
         host: 'localhost',
         user: 'root',
         password: '',
-        database: 'mytest',
+        database: 'mybhoomy_mysearch',
         port: 3306,
         
         // System-optimized connection settings
         connectionLimit: process.env.DB_CONNECTION_LIMIT || optimalSettings.connectionLimit,
-        acquireTimeout: optimalSettings.acquireTimeout,
         queueLimit: process.env.DB_QUEUE_LIMIT || optimalSettings.queueLimit,
         maxIdle: optimalSettings.maxIdle,
         
         // Enhanced connection management
         multipleStatements: true,
         charset: 'utf8mb4',
-        timeout: 60000,
-        reconnect: true,
         idleTimeout: 300000, // 5 minutes idle timeout
         keepAliveInitialDelay: 0,
+        
+        // Lock optimization settings
+        acquireTimeout: 10000, // 10 seconds connection acquisition timeout
+        timeout: 10000, // 10 seconds query timeout
+        reconnect: true,
         
         // Health monitoring settings
         healthCheckInterval: 30000, // 30 seconds
@@ -118,22 +120,24 @@ const dbConfig = {
         host: process.env.DB_HOST || 'localhost',
         user: process.env.DB_USER || 'mybhoomy_admin',
         password: process.env.DB_PASSWORD || 'mhQjj.%C-_LO_U4',
-        database: process.env.DB_NAME || 'mybhoomy_mytest',
+        database: process.env.DB_NAME || 'mybhoomy_mysearch',
         port: process.env.DB_PORT || 3306,
         
         // System-optimized connection settings
         connectionLimit: process.env.DB_CONNECTION_LIMIT || optimalSettings.connectionLimit,
-        acquireTimeout: optimalSettings.acquireTimeout,
         queueLimit: process.env.DB_QUEUE_LIMIT || optimalSettings.queueLimit,
         maxIdle: optimalSettings.maxIdle,
         
         // Enhanced connection management
         multipleStatements: true,
         charset: 'utf8mb4',
-        timeout: 60000,
-        reconnect: true,
         idleTimeout: 300000, // 5 minutes idle timeout
         keepAliveInitialDelay: 0,
+        
+        // Lock optimization settings
+        acquireTimeout: 10000, // 10 seconds connection acquisition timeout
+        timeout: 10000, // 10 seconds query timeout
+        reconnect: true,
         
         // Health monitoring settings
         healthCheckInterval: 30000, // 30 seconds
@@ -147,8 +151,6 @@ const dbConfig = {
         debug: false,
         trace: false,
         
-        // Query timeouts
-        queryTimeout: 30000, // 30 second query timeout
         
         // SSL settings (if needed)
         ssl: process.env.DB_SSL === 'true' ? {
@@ -193,7 +195,6 @@ const verifyDbCredentials = (config) => {
    Connection Limit: ${config.connectionLimit}
    Queue Limit: ${config.queueLimit}
    Max Idle: ${config.maxIdle}
-   Acquire Timeout: ${config.acquireTimeout}ms
    Health Monitoring: ${config.enableHealthMonitoring ? 'Enabled' : 'Disabled'}
 
 📊 Performance Features:
