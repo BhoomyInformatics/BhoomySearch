@@ -124,14 +124,12 @@ class ImageDuplicateChecker {
             if (this.dbConnection) {
                 try {
                     // Check both original URL and normalized URL in database
-                    const result = await this.dbConnection.query(
-                        'SELECT site_img_id FROM site_img WHERE (site_img_link = ? OR site_img_link = ?) AND site_img_site_id = ? LIMIT 1',
-                        [imageUrl, normalizedUrl, siteId],
-                        { timeout: 5000 }
-                    );
+                    const query = 'SELECT site_img_id FROM site_img WHERE (site_img_link = ? OR site_img_link = ?) AND site_img_site_id = ? LIMIT 1';
+                    const raw = await this.dbConnection.query(query, [imageUrl, normalizedUrl, siteId]);
+                    const rows = Array.isArray(raw) ? raw[0] : raw.rows || raw;
                     
-                    if (result && result.length > 0) {
-                        const imageId = result[0].site_img_id;
+                    if (rows && rows.length > 0) {
+                        const imageId = rows[0].site_img_id;
                         
                         // Add to memory cache for faster future access
                         this.addToCache(normalizedUrl, siteId, imageId);
@@ -231,7 +229,8 @@ class ImageDuplicateChecker {
                     `;
                     
                     const params = [...allUrlsToCheck, siteId];
-                    const dbResults = await this.dbConnection.query(query, params, { timeout: 10000 });
+                    const dbRaw = await this.dbConnection.query(query, params);
+                    const dbResults = Array.isArray(dbRaw) ? dbRaw[0] : dbRaw.rows || dbRaw;
                     
                     // Create lookup map for fast checking
                     const existingUrls = new Map();

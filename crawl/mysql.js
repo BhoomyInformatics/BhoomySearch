@@ -9,19 +9,12 @@ class Database {
             host: process.env.DB_HOST || "localhost",
             user: process.env.DB_USER || "mybhoomy_admin",
             password: process.env.DB_PASSWORD || "mhQjj.%C-_LO_U4",
-            database: process.env.DB_NAME || "mybhoomy_mysearch",
-            connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT) || 100,
-            idleTimeout: 300000,
+            database: process.env.DB_NAME || "mybhoomy_mytest",
+            connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT) || 200,
+            idleTimeout: 600000,
             enableKeepAlive: true,
-            acquireTimeout: 90000,      // Pool acquisition timeout
-            queueTimeout: 90000,        // MySQL2 compatible timeout parameter
             queueLimit: 500,            // INCREASED queue limit for multi-session support
-            charset: 'utf8mb4',         // Ensure proper UTF-8 support for international characters
-            
-            // Multi-session optimizations
-            maxIdle: 10,                // Keep 10 idle connections ready
-            idleTimeoutMillis: 30000,   // Close idle connections after 30s
-            evictionRunIntervalMillis: 5000  // Check for idle connections every 5s
+            charset: 'utf8mb4'          // Ensure proper UTF-8 support for international characters
         };
         
         this.initializePool();
@@ -93,61 +86,65 @@ class Database {
         }
 
         try {
-            const [result, fields] = await this.pool.execute(sql, args);
+            const trimmed = (sql || '').trim();
+            const firstWord = trimmed.split(/\s+/)[0].toUpperCase();
+            const isTxnOrSession = ['START', 'COMMIT', 'ROLLBACK', 'SET', 'BEGIN', 'SAVEPOINT', 'RELEASE', 'UNLOCK', 'LOCK', 'SHOW', 'USE'].includes(firstWord);
+            const hasParams = Array.isArray(args) && args.length > 0;
+            const containsPlaceholders = /\?/g.test(trimmed);
+
+            let result, fields;
+
+            // Route transaction/session and non-parameterized statements to pool.query
+            if (isTxnOrSession || (!hasParams && !containsPlaceholders)) {
+                [result, fields] = await this.pool.query(sql);
+            } else {
+                // Parameterized DML/SELECT go through execute (prepared statements)
+                [result, fields] = await this.pool.execute(sql, args);
+            }
             
             // For INSERT, UPDATE, DELETE operations, return the full result metadata
-            // which includes insertId, affectedRows, etc.
-            const sqlType = sql.trim().toUpperCase().split(' ')[0];
-            if (['INSERT', 'UPDATE', 'DELETE'].includes(sqlType)) {
-                // CRITICAL FIX: With mysql2, the result metadata is in the first element
+            const sqlType = trimmed.toUpperCase().split(' ')[0];
+            if (['INSERT', 'UPDATE', 'DELETE', 'REPLACE'].includes(sqlType)) {
                 const resultData = {
-                    insertId: result.insertId || null,
-                    affectedRows: result.affectedRows || 0,
-                    changedRows: result.changedRows || 0,
-                    warningStatus: result.warningStatus || 0,
-                    info: result.info || '',
-                    serverStatus: result.serverStatus || 2,
-                    fieldCount: result.fieldCount || 0
+                    insertId: result?.insertId || null,
+                    affectedRows: result?.affectedRows || 0,
+                    changedRows: result?.changedRows || 0,
+                    warningStatus: result?.warningStatus || 0,
+                    info: result?.info || '',
+                    serverStatus: result?.serverStatus || 2,
+                    fieldCount: result?.fieldCount || 0
                 };
                 
-                // Extra validation for INSERT operations
                 if (sqlType === 'INSERT' && resultData.affectedRows > 0 && !resultData.insertId) {
-                    console.warn('INSERT succeeded but no insertId returned:', {
-                        affectedRows: resultData.affectedRows,
-                        table: this.extractTableName(sql)
-                    });
-                    // Try to get the last insert ID
                     try {
-                        const [lastIdRows] = await this.pool.execute('SELECT LAST_INSERT_ID() as lastId');
+                        const [lastIdRows] = await this.pool.query('SELECT LAST_INSERT_ID() as lastId');
                         if (lastIdRows && lastIdRows[0] && lastIdRows[0].lastId) {
                             resultData.insertId = lastIdRows[0].lastId;
-                            console.log('Retrieved insertId using LAST_INSERT_ID():', resultData.insertId);
                         }
-                    } catch (lastIdError) {
-                        console.warn('Could not retrieve LAST_INSERT_ID():', lastIdError.message);
-                    }
+                    } catch (_) {}
                 }
                 
                 return resultData;
             }
             
-            // For SELECT operations, return just the result rows
+            // For SELECT and other queries, return rows (for SHOW/SET/START etc. this is fine too)
             return result;
         } catch (error) {
             console.error('Error executing query:', error.message);
             console.error('SQL:', sql.substring(0, 200) + '...');
             console.error('Error code:', error.code);
-            
-            // Handle specific error types
+
+            const trimmed = (sql || '').trim();
+            const sqlType = trimmed.split(/\s+/)[0]?.toUpperCase();
+
             if (error.code === 'ER_DUP_ENTRY') {
-                const sqlType = sql.trim().toUpperCase().split(' ')[0];
                 if (sqlType === 'INSERT') {
-                    console.log('Duplicate entry detected, handling gracefully');
                     return {
                         insertId: null,
                         affectedRows: 0,
                         changedRows: 0,
                         isDuplicate: true,
+                        isError: false,
                         error: error.message,
                         warningStatus: 0,
                         info: 'Duplicate entry skipped',
@@ -156,33 +153,53 @@ class Database {
                     };
                 }
             }
-            
-            // Handle timeout errors
-            if (error.code === 'PROTOCOL_CONNECTION_LOST' || 
-                error.code === 'ECONNRESET' || 
+
+            const isTransient = (
+                error.code === 'PROTOCOL_CONNECTION_LOST' ||
+                error.code === 'ECONNRESET' ||
                 error.code === 'ETIMEDOUT' ||
-                error.message.includes('timeout')) {
+                (error.message || '').toLowerCase().includes('timeout')
+            );
+
+            if (isTransient) {
                 console.log('Database connection issue detected, attempting to reconnect...');
                 this.connected = false;
                 this.connectionPromise = this.connect();
                 await this.connectionPromise;
-                
-                // Log timeout error details
+
                 console.error('Database query timeout details:', {
                     query: sql.substring(0, 200) + '...',
                     timeout: this.config.timeout,
                     error: error.message
                 });
             }
-            
-            // For critical errors that might affect data integrity, throw them
-            if (error.code === 'ER_NO_SUCH_TABLE' || 
-                error.code === 'ER_BAD_FIELD_ERROR' || 
+
+            if (error.code === 'ER_NO_SUCH_TABLE' ||
+                error.code === 'ER_BAD_FIELD_ERROR' ||
                 error.code === 'ER_PARSE_ERROR') {
+                // Hard errors should bubble up for callers to handle/migrate
                 throw error;
             }
-            
-            // For other errors, return empty result for backward compatibility
+
+            // For DML statements, return a structured error object so callers don't see []
+            if (['INSERT', 'UPDATE', 'DELETE', 'REPLACE'].includes(sqlType)) {
+                return {
+                    insertId: null,
+                    affectedRows: 0,
+                    changedRows: 0,
+                    isDuplicate: false,
+                    isError: true,
+                    isTransient,
+                    error: error.message,
+                    code: error.code || null,
+                    warningStatus: 0,
+                    info: 'DML failed',
+                    serverStatus: 2,
+                    fieldCount: 0
+                };
+            }
+
+            // For SELECT/others, maintain existing behaviour
             return [];
         }
     }
@@ -219,12 +236,5 @@ class Database {
 }
 
 const con = new Database();
-
-// Wait for connection to be established before exporting
-con.waitForConnection().then(() => {
-    console.log('Database connection ready for use');
-}).catch((error) => {
-    console.error('Database connection failed:', error);
-});
 
 module.exports = { con };

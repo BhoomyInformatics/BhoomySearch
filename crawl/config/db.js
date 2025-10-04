@@ -82,7 +82,7 @@ const dbConfig = {
         host: 'localhost',
         user: 'root',
         password: '',
-        database: 'mybhoomy_mysearch',
+        database: 'mybhoomy_mytest',
         port: 3306,
         
         // System-optimized connection settings
@@ -120,7 +120,7 @@ const dbConfig = {
         host: process.env.DB_HOST || 'localhost',
         user: process.env.DB_USER || 'mybhoomy_admin',
         password: process.env.DB_PASSWORD || 'mhQjj.%C-_LO_U4',
-        database: process.env.DB_NAME || 'mybhoomy_mysearch',
+        database: process.env.DB_NAME || 'mybhoomy_mytest',
         port: process.env.DB_PORT || 3306,
         
         // System-optimized connection settings

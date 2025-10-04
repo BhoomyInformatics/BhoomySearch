@@ -27,9 +27,7 @@ class Server {
     constructor() {
         this.sites;
         this.page = 0;
-        // Windowed processing: fetch 200, sub-batch process 20
-        this.fetchBatchSize = 200;
-        this.subBatchSize = 20;
+        this.parPage = 25; // Reduced batch size for full website crawling
         this.pageNo = 0;
         this.sitesCount = null;
         this.crawlList = [];
@@ -37,7 +35,7 @@ class Server {
         // Initialize the enhanced crawler with your custom settings
         this.crawler = new SearchEngineCrawler(con, {
             maxDepth: 3,
-            maxPagesPerDomain: 250,   // Your setting: 250 pages per domain
+            maxPagesPerDomain: 500,   // Your setting: 500 pages per domain
             batchSize: 10,            // Your setting: 10 URLs concurrent per depth
             maxPages: 250,            // Your setting: 250 pages max queue size
             batchDelay: 2000,
@@ -88,54 +86,35 @@ class Server {
                 return;
             }
             
+            if (!this.sitesCount) await this.loadSiteCount();
+
+            if (this.sitesCount === 0) {
+                console.log('No sites to crawl at this time');
+                return;
+            }
+
             // Initialize crawler
             await this.crawler.initialize();
 
-            let batchNumber = 0;
-            while (true) {
-                batchNumber++;
+            for (let i = 0; i < Math.ceil(this.sitesCount / this.parPage); i++) {
+                console.log(`Processing batch ${i + 1} of ${Math.ceil(this.sitesCount / this.parPage)}`);
                 const rows = await con.query(`
-                    SELECT site_id, site_url FROM sites
-                    WHERE (site_url LIKE '%.in%'
-                           OR site_url LIKE '%.info%')
-                      AND site_active = 1
-                      AND site_locked = 0
-                    ORDER BY site_last_crawl_date ASC
-                    LIMIT ${this.fetchBatchSize};
+                    SELECT * FROM sites
+                    WHERE (sites.site_url LIKE '%.in%'
+                        OR sites.site_url LIKE '%.info%')
+                        AND sites.site_active = 1
+                        AND sites.site_locked = 0
+                    ORDER BY sites.site_last_crawl_date ASC
+                    LIMIT ${this.parPage * i},${this.parPage};
                 `);
-
-                const count = rows ? rows.length : 0;
-                if (!rows || count === 0) {
+                
+                console.log(`Retrieved ${rows ? rows.length : 0} sites for processing`);
+                if (rows && rows.length > 0) {
+                    await this.promissAll(rows);
+                } else {
                     console.log('No more sites to process');
                     break;
                 }
-
-                console.log(`Processing window ${batchNumber} — fetched ${count} sites (max ${this.fetchBatchSize})`);
-
-                const ids = rows.map(r => r.site_id).join(',');
-                await con.query(`
-                    UPDATE sites
-                    SET site_locked = 1,
-                        locked_by = '${script_id}',
-                        site_last_crawl_date = '${new Date().toISOString().replace(/T/, ' ').replace(/\..+/, '')}'
-                    WHERE site_id IN (${ids}) AND site_locked = 0;
-                `);
-
-                const lockedRows = await con.query(`
-                    SELECT * FROM sites
-                    WHERE locked_by = '${script_id}' AND site_id IN (${ids})
-                    ORDER BY site_last_crawl_date ASC;
-                `);
-
-                console.log(`Locked ${lockedRows ? lockedRows.length : 0} sites for this window`);
-
-                for (let start = 0; start < lockedRows.length; start += this.subBatchSize) {
-                    const slice = lockedRows.slice(start, start + this.subBatchSize);
-                    console.log(`Processing sub-batch ${Math.floor(start / this.subBatchSize) + 1} of ${Math.ceil(lockedRows.length / this.subBatchSize)} (size ${slice.length})`);
-                    await this.promissAll(slice);
-                }
-
-                await this.unlockSites(lockedRows);
             }
             
             // Cleanup after all crawling is done
@@ -162,7 +141,9 @@ class Server {
                 // Use SMART crawler to solve the duplicate URL problem
                 const crawlPromise = this.crawler.crawlWebsiteSmart(site.site_url, site.site_id, {
                     maxDepth: 3,
-                    maxPagesPerDomain: 250 // This limit now applies only to NEW URLs (solves your problem!)
+                    maxPagesPerDomain: 500, // This limit now applies only to NEW URLs
+                    forceCrawl: true, // Always crawl for new URLs regardless of existing count
+                    skipRecentCheck: true // Skip recent crawl checks to allow continuous growth
                 }).then(result => {
                     if (result.reason) {
                         console.log(`⏭️ Site skipped: ${site.site_url} - ${result.reason}`);

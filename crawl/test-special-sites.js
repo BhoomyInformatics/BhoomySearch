@@ -53,8 +53,8 @@ async function testSpecialSites() {
                 const result = await crawler.crawlWebsiteSmart(url, siteId, {
                     maxDepth: 3,
                     maxPagesPerDomain: 500,
-                    forceCrawl: true,
-                    skipRecentCheck: true,
+                    forceCrawl: true, // Always crawl for new URLs regardless of existing count
+                    skipRecentCheck: true, // Skip recent crawl checks to allow continuous growth
                     crawlInterval: 'daily'
                 });
                 

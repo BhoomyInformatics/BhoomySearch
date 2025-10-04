@@ -1,10 +1,130 @@
 const crypto = require('crypto');
 const { logger } = require('./logger');
 
+/**
+ * Bloom Filter implementation for fast duplicate detection
+ * Provides probabilistic data structure for efficient membership testing
+ */
+class BloomFilter {
+    constructor(size = 1000000, hashCount = 3) {
+        this.size = size;
+        this.hashCount = hashCount;
+        this.bitArray = new Array(size).fill(false);
+        this.itemCount = 0;
+        this.falsePositiveRate = 0;
+    }
+    
+    /**
+     * Add item to bloom filter
+     */
+    add(item) {
+        for (let i = 0; i < this.hashCount; i++) {
+            const hash = this.hash(item, i);
+            this.bitArray[hash % this.size] = true;
+        }
+        this.itemCount++;
+        this.updateFalsePositiveRate();
+    }
+    
+    /**
+     * Check if item might be in the filter
+     * Returns true if item might be present (with possibility of false positive)
+     * Returns false if item is definitely not present
+     */
+    mightContain(item) {
+        for (let i = 0; i < this.hashCount; i++) {
+            const hash = this.hash(item, i);
+            if (!this.bitArray[hash % this.size]) {
+                return false;
+            }
+        }
+        return true;
+    }
+    
+    /**
+     * Hash function with different seeds for multiple hash functions
+     */
+    hash(item, seed) {
+        const hash = crypto.createHash('sha256');
+        hash.update(item + seed.toString());
+        const hex = hash.digest('hex');
+        
+        // Convert hex to integer
+        let result = 0;
+        for (let i = 0; i < hex.length; i += 2) {
+            result = (result * 256 + parseInt(hex.substr(i, 2), 16)) % this.size;
+        }
+        return Math.abs(result);
+    }
+    
+    /**
+     * Calculate current false positive rate
+     */
+    updateFalsePositiveRate() {
+        if (this.itemCount === 0) {
+            this.falsePositiveRate = 0;
+            return;
+        }
+        
+        // Formula: (1 - e^(-k*n/m))^k
+        // where k = hashCount, n = itemCount, m = size
+        const k = this.hashCount;
+        const n = this.itemCount;
+        const m = this.size;
+        
+        const exponent = -(k * n) / m;
+        const base = 1 - Math.exp(exponent);
+        this.falsePositiveRate = Math.pow(base, k);
+    }
+    
+    /**
+     * Get statistics about the bloom filter
+     */
+    getStats() {
+        return {
+            size: this.size,
+            hashCount: this.hashCount,
+            itemCount: this.itemCount,
+            falsePositiveRate: this.falsePositiveRate,
+            utilization: (this.itemCount / this.size) * 100,
+            bitsSet: this.bitArray.filter(bit => bit).length
+        };
+    }
+    
+    /**
+     * Clear the bloom filter
+     */
+    clear() {
+        this.bitArray.fill(false);
+        this.itemCount = 0;
+        this.falsePositiveRate = 0;
+    }
+    
+    /**
+     * Merge another bloom filter into this one
+     */
+    merge(other) {
+        if (other.size !== this.size || other.hashCount !== this.hashCount) {
+            throw new Error('Cannot merge bloom filters with different sizes or hash counts');
+        }
+        
+        for (let i = 0; i < this.size; i++) {
+            this.bitArray[i] = this.bitArray[i] || other.bitArray[i];
+        }
+        
+        this.itemCount += other.itemCount;
+        this.updateFalsePositiveRate();
+    }
+}
+
+/**
+ * Unified Duplicate Checker with Bloom Filter, Site-Aware Features, and Enhanced Performance
+ * Combines all three duplicate checker implementations into one comprehensive solution
+ */
 class DuplicateChecker {
     constructor(options = {}) {
         this.dbConnection = options.dbConnection || null;
-        this.useDatabaseStorage = options.useDatabaseStorage !== false; // Default to true
+        this.useDatabaseStorage = options.useDatabaseStorage !== false;
         this.useContentHashing = options.useContentHashing !== false;
         this.normalizeUrls = options.normalizeUrls !== false;
         this.tableName = options.tableName || 'crawled_urls';
@@ -12,29 +132,46 @@ class DuplicateChecker {
         this.batchSize = options.batchSize || 500;
         this.batchTimeout = options.batchTimeout || 30000;
         
-        // In-memory caches for fast lookups
+        // Enhanced caching with Bloom Filter
+        this.bloomFilter = new BloomFilter(1000000, 3); // 1M items, 3 hash functions
         this.crawledUrls = new Set();
         this.urlHashes = new Set();
         this.contentHashes = new Set();
         this.pendingBatch = [];
         this.batchTimer = null;
         
-        // Statistics
+        // Site-aware features
+        this.siteCaches = new Map(); // siteId -> { crawledUrls, urlHashes, contentHashes, stats }
+        this.currentSiteId = null;
+        this.currentSiteStats = null;
+        
+        // Global statistics
+        this.globalStats = {
+            sitesInitialized: 0,
+            totalUrlsChecked: 0,
+            duplicatesSkipped: 0,
+            newUrlsFound: 0,
+            httpRequestsSaved: 0
+        };
+        
+        // Performance tracking
         this.stats = {
             duplicatesFound: 0,
             urlDuplicates: 0,
             contentDuplicates: 0,
             cacheHits: 0,
+            bloomFilterHits: 0,
             databaseHits: 0,
-            totalChecked: 0
+            totalChecked: 0,
+            falsePositives: 0
         };
         
-        // Log configuration on startup
-        logger.info('DuplicateChecker initialized', {
+        logger.info('Unified DuplicateChecker initialized with Bloom Filter and Site-Aware features', {
             useDatabaseStorage: this.useDatabaseStorage,
             useContentHashing: this.useContentHashing,
             normalizeUrls: this.normalizeUrls,
             maxCacheSize: this.maxCacheSize,
+            bloomFilterSize: this.bloomFilter.size,
             hasDbConnection: !!this.dbConnection
         });
         
@@ -42,7 +179,6 @@ class DuplicateChecker {
         if (this.dbConnection && this.useDatabaseStorage) {
             this.createDatabaseTable().catch(error => {
                 logger.error('Failed to create duplicate checker table', { error: error.message });
-                // Disable database storage if table creation fails
                 this.useDatabaseStorage = false;
                 logger.warn('Database storage disabled due to table creation failure');
             });
@@ -53,222 +189,109 @@ class DuplicateChecker {
 
     setDatabaseConnection(dbConnection) {
         this.dbConnection = dbConnection;
-        this.useDatabaseStorage = !!dbConnection; // Enable database storage when connection is set
+        this.useDatabaseStorage = !!dbConnection;
         
         logger.info('Database connection set for DuplicateChecker', { 
             hasConnection: !!this.dbConnection,
             useDatabaseStorage: this.useDatabaseStorage 
         });
         
-        // Create database table if connection is available
         if (this.dbConnection && this.useDatabaseStorage) {
             this.createDatabaseTable().catch(error => {
                 logger.error('Failed to create duplicate checker table', { error: error.message });
-                // Disable database storage if table creation fails
                 this.useDatabaseStorage = false;
                 logger.warn('Database storage disabled due to table creation failure');
             });
         }
     }
 
-    async isDuplicate(url, siteId, options = {}) {
+    /**
+     * Initialize duplicate checker for a specific site (Site-Aware feature)
+     */
+    async initializeForSite(siteId, siteUrl = null) {
         try {
-            const urlHash = this.generateUrlHash(url);
+            this.currentSiteId = siteId;
             
-            // Check memory cache first
-            const cacheKey = `${siteId}:${urlHash}`;
-            if (this.urlCache.has(cacheKey)) {
-                return { isDuplicate: true, reason: 'memory_cache' };
+            if (this.siteCaches.has(siteId)) {
+                this.currentSiteStats = this.siteCaches.get(siteId).stats;
+                logger.info('Site already initialized, using cached data', {
+                    siteId,
+                    cachedUrls: this.currentSiteStats.totalCrawledUrls
+                });
+                return this.currentSiteStats;
             }
-
-            // Check database if connection is available
-            if (this.dbConnection && this.useDatabaseStorage) {
-                try {
-                    const result = await this.dbConnection.query(
-                        'SELECT url_id, url_hash, crawled_at FROM site_data WHERE site_id = ? AND url_hash = ?',
-                        [siteId, urlHash]
-                    );
-
-                    if (result && result.length > 0) {
-                        // Store in memory cache for faster future access
-                        this.urlCache.set(cacheKey, {
-                            urlHash,
-                            crawledAt: result[0].crawled_at,
-                            urlId: result[0].url_id
-                        });
-                        
-                        return { 
-                            isDuplicate: true, 
-                            reason: 'database',
-                            urlId: result[0].url_id,
-                            crawledAt: result[0].crawled_at
-                        };
-                    }
-                } catch (dbError) {
-                    logger.warn('Database duplicate check failed, falling back to memory-only mode', {
-                        error: dbError.message,
-                        url,
-                        siteId
-                    });
-                    // Continue with memory-only mode
+            
+            const siteCache = {
+                crawledUrls: new Set(),
+                urlHashes: new Set(),
+                contentHashes: new Set(),
+                stats: {
+                    siteId,
+                    siteUrl,
+                    totalCrawledUrls: 0,
+                    uniqueContentHashes: 0,
+                    lastCrawlDate: null,
+                    urlsAddedToday: 0,
+                    avgDailyUrls: 0,
+                    estimatedNewUrls: 0,
+                    crawlPriority: 'normal'
                 }
-            }
-
-            // If not found in database, check if URL should be crawled based on patterns
-            const shouldCrawl = this.shouldCrawlUrl(url, options);
-            if (!shouldCrawl) {
-                return { isDuplicate: true, reason: 'url_pattern' };
-            }
-
-            return { isDuplicate: false, reason: 'new_url' };
-        } catch (error) {
-            logger.error('Error checking duplicate URL', {
-                error: error.message,
-                url,
-                siteId
-            });
-            // Default to not duplicate on error to allow crawling
-            return { isDuplicate: false, reason: 'error_fallback' };
-        }
-    }
-
-    shouldCrawlUrl(url, options = {}) {
-        try {
-            const urlObj = new URL(url);
+            };
             
-            // Skip certain file types
-            const skipExtensions = [
-                '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-                '.zip', '.rar', '.tar', '.gz', '.mp3', '.mp4', '.avi', '.mov',
-                '.wmv', '.flv', '.webm', '.ogg', '.wav', '.jpg', '.jpeg',
-                '.png', '.gif', '.bmp', '.svg', '.ico', '.css', '.js',
-                '.xml', '.json', '.txt', '.log', '.csv'
-            ];
+            if (!this.dbConnection) {
+                logger.warn('No database connection, using memory-only mode', { siteId });
+                this.siteCaches.set(siteId, siteCache);
+                this.currentSiteStats = siteCache.stats;
+                return this.currentSiteStats;
+            }
             
-            const pathname = urlObj.pathname.toLowerCase();
-            // Check if URL ends with any of the skip extensions (with or without query parameters)
-            if (skipExtensions.some(ext => pathname.endsWith(ext) || url.toLowerCase().includes(ext + '?'))) {
-                return false;
-            }
-
-            // Skip certain protocols
-            if (['mailto:', 'tel:', 'javascript:', 'data:', 'ftp:', 'file:'].some(protocol => 
-                url.toLowerCase().startsWith(protocol))) {
-                return false;
-            }
-
-            // Skip very long URLs
-            if (url.length > 2048) {
-                return false;
-            }
-
-            // Skip URLs with certain patterns
-            const skipPatterns = [
-                /\/wp-admin\//,
-                /\/wp-includes\//,
-                /\/wp-content\/uploads\//,
-                /\/admin\//,
-                /\/login\//,
-                /\/logout\//,
-                /\/register\//,
-                /\/signup\//,
-                /\/signin\//,
-                /\/cart\//,
-                /\/checkout\//,
-                /\/payment\//,
-                /\/api\//,
-                /\/ajax\//,
-                /\/search\?/,
-                /\/tag\//,
-                /\/category\//,
-                /\/author\//,
-                /\/page\//,
-                /\/comment\//,
-                /\/trackback\//,
-                /\/pingback\//,
-                /\/feed\//,
-                /\/rss\//,
-                /\/atom\//,
-                /\/sitemap\//,
-                /\.xml$/,
-                /\.json$/,
-                /\.txt$/,
-                /\.log$/,
-                /\.csv$/
-            ];
-
-            if (skipPatterns.some(pattern => pattern.test(url))) {
-                return false;
-            }
-
-            // Allow URLs with content-related patterns
-            const contentPatterns = [
-                /\/article\//,
-                /\/news\//,
-                /\/blog\//,
-                /\/post\//,
-                /\/story\//,
-                /\/content\//,
-                /\/page\//,
-                /\/about\//,
-                /\/contact\//,
-                /\/services\//,
-                /\/products\//,
-                /\/gallery\//,
-                /\/photos\//,
-                /\/videos\//,
-                /\/events\//,
-                /\/careers\//,
-                /\/team\//,
-                /\/faq\//,
-                /\/help\//,
-                /\/support\//,
-                /\/privacy\//,
-                /\/terms\//,
-                /\/policy\//,
-                /\/sitemap\//,
-                /\/robots\//
-            ];
-
-            // If URL matches content patterns, allow crawling
-            if (contentPatterns.some(pattern => pattern.test(url))) {
-                return true;
-            }
-
-            // For other URLs, check if they have meaningful content indicators
-            const hasContentIndicators = (
-                url.includes('/') && 
-                !url.includes('?') && 
-                !url.includes('#') &&
-                url.length > 10
-            );
-
-            return hasContentIndicators;
-        } catch (error) {
-            logger.error('Error in shouldCrawlUrl', {
-                error: error.message,
-                url
+            await this.loadSiteStatistics(siteId, siteCache);
+            await this.loadSiteCrawledUrls(siteId, siteCache);
+            this.calculateSitePriority(siteCache);
+            
+            this.siteCaches.set(siteId, siteCache);
+            this.currentSiteStats = siteCache.stats;
+            this.globalStats.sitesInitialized++;
+            
+            logger.info('Site initialized successfully', {
+                siteId,
+                siteUrl,
+                totalCrawledUrls: siteCache.stats.totalCrawledUrls,
+                urlsAddedToday: siteCache.stats.urlsAddedToday,
+                crawlPriority: siteCache.stats.crawlPriority,
+                estimatedNewUrls: siteCache.stats.estimatedNewUrls
             });
-            // Default to allowing crawl on error
-            return true;
+            
+            return this.currentSiteStats;
+            
+        } catch (error) {
+            logger.error('Error initializing site for duplicate checking', {
+                siteId,
+                siteUrl,
+                error: error.message
+            });
+            throw error;
         }
     }
 
     /**
-     * Fast pre-crawl duplicate checking for URLs
-     * This method is optimized for checking URLs before making HTTP requests
+     * Fast pre-crawl duplicate checking using Bloom Filter (Enhanced feature)
      */
     async isUrlAlreadyCrawled(url, siteId = null) {
         try {
             this.stats.totalChecked++;
             
-            // Normalize URL if enabled
             const normalizedUrl = this.normalizeUrls ? this.normalizeUrl(url) : url;
             const urlHash = this.hashUrl(normalizedUrl);
             
-            // Fast in-memory check first
-            const memoryKey = siteId ? `${urlHash}:${siteId}` : urlHash;
+            // First check: Bloom Filter (fastest)
+            const bloomKey = siteId ? `${urlHash}:${siteId}` : urlHash;
+            if (!this.bloomFilter.mightContain(bloomKey)) {
+                return false;
+            }
             
+            // Second check: Memory cache (fast)
+            const memoryKey = siteId ? `${urlHash}:${siteId}` : urlHash;
             if (this.urlHashes.has(memoryKey)) {
                 this.stats.duplicatesFound++;
                 this.stats.urlDuplicates++;
@@ -280,12 +303,11 @@ class DuplicateChecker {
                 return true;
             }
 
-            // Database check if memory cache miss
+            // Third check: Database (slower but definitive)
             if (this.dbConnection && this.useDatabaseStorage) {
                 try {
                     const exists = await this.checkUrlInDatabase(normalizedUrl, urlHash, siteId);
                     if (exists) {
-                        // Add to memory cache for faster future lookups
                         this.addToCache(normalizedUrl, urlHash, null, siteId);
                         this.stats.duplicatesFound++;
                         this.stats.urlDuplicates++;
@@ -295,13 +317,18 @@ class DuplicateChecker {
                             siteId 
                         });
                         return true;
+                    } else {
+                        this.stats.falsePositives++;
+                        logger.debug('Bloom filter false positive detected', { 
+                            url: normalizedUrl, 
+                            siteId 
+                        });
                     }
                 } catch (dbError) {
                     logger.warn('Database duplicate check failed, treating as non-duplicate', { 
                         url: normalizedUrl, 
                         error: dbError.message 
                     });
-                    // Treat as non-duplicate if database check fails
                 }
             }
 
@@ -312,51 +339,97 @@ class DuplicateChecker {
                 siteId, 
                 error: error.message 
             });
-            return false; // Default to not duplicate on error
+            return false;
         }
     }
 
-    async isContentDuplicate(content, siteId = null) {
-        try {
-            if (!content || typeof content !== 'string') {
-                return false;
-            }
-
-            const contentHash = this.hashContent(content);
-            
-            // Check in-memory cache only (database disabled temporarily)
-            if (this.contentHashes.has(contentHash)) {
-                // If siteId is provided, check if it's a duplicate within the same site
-                if (siteId) {
-                    const cacheKey = `${contentHash}:${siteId}`;
-                    if (this.contentHashes.has(cacheKey)) {
-                        return true;
-                    }
-                } else {
-                    return true;
+    /**
+     * Site-aware URL filtering (Site-Aware feature)
+     */
+    async findNewUrls(urls, siteId = null, options = {}) {
+        if (!Array.isArray(urls) || urls.length === 0) {
+            return [];
+        }
+        
+        const targetSiteId = siteId || this.currentSiteId;
+        if (!targetSiteId) {
+            logger.warn('No site ID available for URL filtering');
+            return urls;
+        }
+        
+        if (!this.siteCaches.has(targetSiteId)) {
+            await this.initializeForSite(targetSiteId);
+        }
+        
+        const siteCache = this.siteCaches.get(targetSiteId);
+        const newUrls = [];
+        const duplicateUrls = [];
+        
+        const isForceCrawl = options.forceCrawl || options.skipRecentCheck || options.crawlInterval === 'daily';
+        
+        logger.info('URL filtering starting', {
+            siteId: targetSiteId,
+            totalUrls: urls.length,
+            isForceCrawl
+        });
+        
+        for (const url of urls) {
+            try {
+                const normalizedUrl = this.normalizeUrl(url);
+                const urlHash = this.hashUrl(normalizedUrl);
+                
+                if (isForceCrawl) {
+                    newUrls.push(url);
+                    this.globalStats.newUrlsFound++;
+                    continue;
                 }
-            }
-
-            // Database checking temporarily disabled to prevent timeouts
-            if (false && this.dbConnection && this.useDatabaseStorage) {
-                const exists = await this.checkContentInDatabase(contentHash, siteId);
-                if (exists) {
-                    // Add to cache for faster future lookups
-                    this.contentHashes.add(contentHash);
-                    if (siteId) {
-                        this.contentHashes.add(`${contentHash}:${siteId}`);
+                
+                if (siteCache.urlHashes.has(urlHash)) {
+                    const allowRecrawl = options.allowRecrawl || 
+                                        options.maxAge || 
+                                        siteCache.stats.estimatedNewUrls > 100;
+                    
+                    if (allowRecrawl) {
+                        newUrls.push(url);
+                        this.globalStats.newUrlsFound++;
+                        continue;
                     }
-                    return true;
+                    
+                    duplicateUrls.push(url);
+                    this.globalStats.duplicatesSkipped++;
+                    continue;
                 }
-            }
-
-            return false;
+                
+                newUrls.push(url);
+                this.globalStats.newUrlsFound++;
+                
         } catch (error) {
-            logger.error('Error checking content duplicate', { siteId, error: error.message });
-            return false;
+                logger.warn('Error processing URL in filter', {
+                    url,
+                    error: error.message
+                });
+                newUrls.push(url);
+            }
         }
+        
+        this.globalStats.totalUrlsChecked += urls.length;
+        this.globalStats.httpRequestsSaved += duplicateUrls.length;
+        
+        logger.info('URL filtering completed', {
+            siteId: targetSiteId,
+            totalUrls: urls.length,
+            newUrls: newUrls.length,
+            duplicatesSkipped: duplicateUrls.length,
+            efficiency: Math.round((duplicateUrls.length / urls.length) * 100),
+            forceCrawl: isForceCrawl
+        });
+        
+        return newUrls;
     }
 
+    /**
+     * Mark URL as crawled and add to Bloom Filter
+     */
     async markAsCrawled(url, content = null, siteId = null) {
         try {
             const normalizedUrl = this.normalizeUrls ? this.normalizeUrl(url) : url;
@@ -367,30 +440,33 @@ class DuplicateChecker {
                 contentHash = this.hashContent(content);
             }
 
-            // Add to in-memory cache for performance
+            // Add to Bloom Filter first (fastest)
+            const bloomKey = siteId ? `${urlHash}:${siteId}` : urlHash;
+            this.bloomFilter.add(bloomKey);
+            
+            // Add to in-memory cache
             this.addToCache(normalizedUrl, urlHash, contentHash, siteId);
 
-            // Database storage disabled for DuplicateChecker to prevent placeholder titles
-            // The ContentIndexer will handle database storage with proper titles
-            logger.debug('URL marked as crawled (memory-only)', { 
-                url: normalizedUrl, 
-                siteId,
-                reason: 'Database storage disabled to prevent placeholder titles'
-            });
-            
-            /* DISABLED: Database storage moved to ContentIndexer only
-            if (this.dbConnection && this.useDatabaseStorage) {
-                try {
-                    await this.storeInDatabase(normalizedUrl, urlHash, contentHash, siteId);
-                    logger.debug('URL stored in database', { url: normalizedUrl, siteId });
-                } catch (dbError) {
-                    logger.warn('Failed to store URL in database, continuing with memory-only', { 
-                        url: normalizedUrl, 
-                        error: dbError.message 
-                    });
+            // Add to site cache if siteId provided
+            if (siteId) {
+                if (!this.siteCaches.has(siteId)) {
+                    await this.initializeForSite(siteId);
+                }
+                const siteCache = this.siteCaches.get(siteId);
+                siteCache.urlHashes.add(urlHash);
+                siteCache.crawledUrls.add(normalizedUrl);
+                siteCache.stats.totalCrawledUrls++;
+                
+                if (contentHash) {
+                    siteCache.contentHashes.add(contentHash);
                 }
             }
-            */
+            
+            logger.debug('URL marked as crawled (Bloom Filter + memory)', { 
+                url: normalizedUrl, 
+                siteId,
+                bloomFilterStats: this.bloomFilter.getStats()
+            });
 
             return true;
         } catch (error) {
@@ -399,9 +475,11 @@ class DuplicateChecker {
         }
     }
 
+    /**
+     * Add to cache with size management
+     */
     addToCache(url, urlHash, contentHash, siteId = null) {
         try {
-            // Manage cache size
             if (this.crawledUrls.size >= this.maxCacheSize) {
                 this.clearOldestEntries();
             }
@@ -424,11 +502,13 @@ class DuplicateChecker {
         }
     }
 
+    /**
+     * Clear oldest cache entries to manage memory
+     */
     clearOldestEntries() {
         try {
-            const entriesToRemove = Math.floor(this.maxCacheSize * 0.1); // Remove 10%
+            const entriesToRemove = Math.floor(this.maxCacheSize * 0.1);
             
-            // Convert sets to arrays, remove oldest entries, convert back
             const urlArray = Array.from(this.crawledUrls);
             const hashArray = Array.from(this.urlHashes);
             const contentHashArray = Array.from(this.contentHashes);
@@ -443,18 +523,214 @@ class DuplicateChecker {
         }
     }
 
+    /**
+     * Load site statistics from database
+     * OPTIMIZED: Added timeout handling and graceful degradation
+     */
+    async loadSiteStatistics(siteId, siteCache) {
+        try {
+            // Use a simpler, faster query that's less likely to timeout
+            const statsQuery = `
+                SELECT 
+                    COUNT(*) AS total_crawled_urls,
+                    MAX(crawl_date) AS last_crawl_date
+                FROM site_data
+                WHERE site_data_site_id = ?
+            `;
+
+            // Short timeout with graceful fallback
+            const timeoutMs = 5000; // 5 seconds
+            const timeoutPromise = new Promise((_, reject) => {
+                setTimeout(() => reject(new Error('Stats query timeout')), timeoutMs);
+            });
+            
+            const queryPromise = this.dbConnection.query(statsQuery, [siteId]);
+            
+            let statsRows;
+            try {
+                statsRows = await Promise.race([queryPromise, timeoutPromise]);
+                
+                // Normalize driver return shape
+                if (Array.isArray(statsRows) && Array.isArray(statsRows[0])) {
+                    statsRows = statsRows[0];
+                }
+                
+                if (Array.isArray(statsRows) && statsRows[0]) {
+                    const stats = statsRows[0];
+                    siteCache.stats.totalCrawledUrls = parseInt(stats.total_crawled_urls || 0) || 0;
+                    siteCache.stats.lastCrawlDate = stats.last_crawl_date || null;
+                    
+                    logger.debug('Loaded site statistics', {
+                        siteId,
+                        totalCrawledUrls: siteCache.stats.totalCrawledUrls,
+                        lastCrawlDate: siteCache.stats.lastCrawlDate
+                    });
+                }
+            } catch (timeoutError) {
+                if (timeoutError.message === 'Stats query timeout') {
+                    logger.warn('Site statistics query timed out, using defaults', {
+                        siteId,
+                        timeoutMs,
+                        message: 'This is OK - crawler will work with default statistics'
+                    });
+                    // Use default values
+                    siteCache.stats.totalCrawledUrls = 0;
+                    siteCache.stats.uniqueContentHashes = 0;
+                    siteCache.stats.lastCrawlDate = null;
+                    siteCache.stats.urlsAddedToday = 0;
+                    siteCache.stats.avgDailyUrls = 0;
+                    return;
+                }
+                throw timeoutError;
+            }
+            
+            // Skip the expensive queries for today's count and averages
+            // These are not critical for basic crawling functionality
+            siteCache.stats.urlsAddedToday = 0;
+            siteCache.stats.avgDailyUrls = 0;
+            siteCache.stats.uniqueContentHashes = 0;
+            
+        } catch (error) {
+            logger.warn('Error loading site statistics, using defaults', { 
+                siteId, 
+                error: error.message,
+                message: 'Crawler will work with default statistics'
+            });
+            // Use default values on error
+            siteCache.stats.totalCrawledUrls = 0;
+            siteCache.stats.uniqueContentHashes = 0;
+            siteCache.stats.lastCrawlDate = null;
+            siteCache.stats.urlsAddedToday = 0;
+            siteCache.stats.avgDailyUrls = 0;
+        }
+    }
+
+    /**
+     * Load site crawled URLs into cache
+     * OPTIMIZED: Removed ORDER BY to prevent filesort, added timeout handling
+     */
+    async loadSiteCrawledUrls(siteId, siteCache) {
+        try {
+            // OPTIMIZED: Removed ORDER BY to prevent expensive filesort on large tables
+            // Removed date filter initially to test if there are any URLs at all
+            const urlsQuery = `
+                SELECT 
+                    site_data_url_hash, 
+                    site_data_link, 
+                    content_hash
+                FROM site_data 
+                WHERE site_data_site_id = ? 
+                    AND site_data_url_hash IS NOT NULL
+                LIMIT ?
+            `;
+            
+            const limit = Math.min(this.maxCacheSize, 5000); // Increased from 1000 to 5000
+            
+            // Use shorter timeout with graceful degradation
+            const timeoutMs = 8000; // 8 seconds
+            const timeoutPromise = new Promise((_, reject) => {
+                setTimeout(() => reject(new Error('Query timeout')), timeoutMs);
+            });
+            
+            const queryPromise = this.dbConnection.query(urlsQuery, [siteId, limit]);
+            
+            let urlResults;
+            try {
+                urlResults = await Promise.race([queryPromise, timeoutPromise]);
+                
+                // Normalize driver return shape (some drivers return [rows, fields])
+                if (Array.isArray(urlResults) && Array.isArray(urlResults[0])) {
+                    urlResults = urlResults[0];
+                }
+            } catch (timeoutError) {
+                if (timeoutError.message === 'Query timeout') {
+                    logger.warn('Site URL loading timed out, continuing with empty cache', {
+                        siteId,
+                        timeoutMs,
+                        message: 'This is OK - crawler will work without pre-cached URLs'
+                    });
+                    return; // Continue without cached URLs
+                }
+                throw timeoutError;
+            }
+            
+            if (urlResults && urlResults.length > 0) {
+                urlResults.forEach(row => {
+                    if (row.site_data_url_hash) {
+                        siteCache.urlHashes.add(row.site_data_url_hash);
+                        siteCache.crawledUrls.add(row.site_data_link);
+                        
+                        if (row.content_hash) {
+                            siteCache.contentHashes.add(row.content_hash);
+                        }
+                    }
+                });
+                
+                logger.info('Loaded site URLs into cache', {
+                    siteId,
+                    urlsLoaded: urlResults.length,
+                    cacheSize: siteCache.urlHashes.size
+                });
+            } else {
+                logger.info('No cached URLs loaded for site', {
+                    siteId,
+                    message: 'This is OK for new sites or when table is empty'
+                });
+            }
+        } catch (error) {
+            logger.warn('Error loading site crawled URLs, continuing without cache', { 
+                siteId, 
+                error: error.message,
+                message: 'Crawler will work without pre-cached URLs'
+            });
+            // Don't throw - allow crawler to continue without cached URLs
+        }
+    }
+
+    /**
+     * Calculate site crawling priority
+     */
+    calculateSitePriority(siteCache) {
+        const stats = siteCache.stats;
+        
+        const daysSinceLastCrawl = stats.lastCrawlDate ? 
+            Math.floor((new Date() - new Date(stats.lastCrawlDate)) / (1000 * 60 * 60 * 24)) : 999;
+        
+        let estimatedNewUrls = 0;
+        if (stats.avgDailyUrls > 0 && daysSinceLastCrawl > 0) {
+            estimatedNewUrls = Math.floor(stats.avgDailyUrls * daysSinceLastCrawl);
+        }
+        
+        if (stats.totalCrawledUrls === 0) {
+            stats.crawlPriority = 'high';
+            stats.estimatedNewUrls = 1000;
+        } else if (daysSinceLastCrawl > 7 && stats.avgDailyUrls > 10) {
+            stats.crawlPriority = 'high';
+            stats.estimatedNewUrls = estimatedNewUrls;
+        } else if (daysSinceLastCrawl > 3 && stats.avgDailyUrls > 5) {
+            stats.crawlPriority = 'normal';
+            stats.estimatedNewUrls = estimatedNewUrls;
+        } else if (stats.totalCrawledUrls > 1000 && daysSinceLastCrawl <= 1) {
+            stats.crawlPriority = 'low';
+            stats.estimatedNewUrls = Math.min(estimatedNewUrls, 50);
+        } else {
+            stats.crawlPriority = 'normal';
+            stats.estimatedNewUrls = estimatedNewUrls;
+        }
+    }
+
+    /**
+     * Check URL in database
+     */
     async checkUrlInDatabase(url, urlHash, siteId = null) {
         try {
             if (!this.dbConnection || !this.useDatabaseStorage) {
-                logger.debug('Database not available or disabled, skipping URL duplicate check', { url });
-                return false; // Assume not duplicate if DB unavailable or disabled
+                return false;
             }
 
-            // Check in both crawled_urls table and site_data table
             let query, params;
             
             if (siteId) {
-                // Check within specific site
                 query = `
                     SELECT 1 FROM site_data 
                     WHERE site_data_url_hash = ? AND site_data_site_id = ?
@@ -462,7 +738,6 @@ class DuplicateChecker {
                 `;
                 params = [urlHash, siteId];
             } else {
-                // Check across all sites
                 query = `
                     SELECT 1 FROM site_data 
                     WHERE site_data_url_hash = ?
@@ -471,190 +746,28 @@ class DuplicateChecker {
                 params = [urlHash];
             }
 
-            const [rows] = await this.dbConnection.query(query, params);
-            const exists = rows && rows.length > 0;
-            
-            logger.debug('Database duplicate check completed', { 
-                url, 
-                urlHash, 
-                siteId, 
-                exists 
-            });
-            
-            return exists;
+            // Use short timeout and treat timeouts as "not duplicate" to keep crawl flowing
+            let rows = await this.dbConnection.query(query, params, { timeout: 5000 });
+            // Normalize driver return shape
+            if (Array.isArray(rows) && Array.isArray(rows[0])) {
+                rows = rows[0];
+            }
+            return Array.isArray(rows) && rows.length > 0;
         } catch (error) {
+            // Gracefully degrade on timeout
+            if (String(error.message || '').toLowerCase().includes('timeout')) {
+                logger.warn('Duplicate check timed out, allowing URL to proceed', { 
+                    url, urlHash, siteId, timeoutMs: 5000 
+                });
+                return false;
+            }
             logger.error('Database error during duplicate check', { 
                 url, 
                 urlHash, 
                 siteId, 
                 error: error.message 
             });
-            throw error; // Re-throw to be handled by caller
-        }
-    }
-
-    async checkContentInDatabase(contentHash, siteId = null) {
-        try {
-            if (!this.dbConnection) {
-                logger.debug('Database not available, skipping content duplicate check');
-                return false; // Assume not duplicate if DB unavailable
-            }
-
-            const query = `
-                SELECT 1 FROM ${this.tableName} 
-                WHERE content_hash = ? 
-                LIMIT 1
-            `;
-            
-            const result = await this.executeQuery(query, [contentHash]);
-            return result.length > 0;
-        } catch (error) {
-            logger.warn('Error checking content in database, assuming not duplicate', { 
-                error: error.message 
-            });
-            return false; // Assume not duplicate on error
-        }
-    }
-
-    async storeInDatabase(url, urlHash, contentHash, siteId = null) {
-        try {
-            // DISABLED: DuplicateChecker should not insert into site_data table
-            // The site_data table should only be populated by ContentIndexer with real titles
-            // This prevents "Pre-crawl duplicate check" placeholder titles from being inserted
-            
-            logger.debug('Database storage disabled for DuplicateChecker to prevent placeholder titles', { 
-                url, 
-                reason: 'site_data table should only contain real content with proper titles'
-            });
-            
-            return; // Skip database storage entirely
-            
-            /* ORIGINAL CODE DISABLED TO PREVENT PLACEHOLDER TITLES:
-            if (!this.dbConnection || !this.useDatabaseStorage) {
-                logger.debug('Database not available or disabled, skipping URL storage', { url });
-                return; // Skip storage if DB unavailable or disabled
-            }
-
-            // Use INSERT IGNORE for better performance and duplicate handling
-            const insertQuery = `
-                INSERT IGNORE INTO site_data (
-                    site_data_url_hash, 
-                    site_data_site_id, 
-                    site_data_link, 
-                    site_data_title,
-                    status,
-                    crawl_date
-                ) VALUES (?, ?, ?, ?, 'duplicate_check', NOW())
-            `;
-
-            const values = [
-                urlHash,
-                siteId,
-                url,
-                'Pre-crawl duplicate check', // Placeholder title - THIS WAS THE PROBLEM
-            ];
-
-            logger.debug('Storing URL in database for duplicate tracking', { 
-                url, 
-                urlHash: urlHash.substring(0, 8) + '...',
-                siteId 
-            });
-
-            const result = await this.dbConnection.query(insertQuery, values);
-            
-            if (result.affectedRows > 0) {
-                logger.debug('URL stored in database successfully', { 
-                    url, 
-                    insertId: result.insertId 
-                });
-            } else {
-                logger.debug('URL already exists in database (INSERT IGNORE)', { url });
-            }
-            */
-
-        } catch (error) {
-            logger.error('Error in storeInDatabase (disabled)', { 
-                url, 
-                error: error.message 
-            });
-            // Don't throw error - continue with memory-only if DB fails
-        }
-    }
-
-    resetBatchTimer() {
-        if (this.batchTimer) {
-            clearTimeout(this.batchTimer);
-        }
-        
-        this.batchTimer = setTimeout(async () => {
-            try {
-                await this.processBatch();
-            } catch (error) {
-                logger.warn('Error in batch timer processing', { error: error.message });
-            }
-        }, this.batchTimeout);
-    }
-
-    async processBatch() {
-        try {
-            // Database batch processing completely disabled for performance
-            logger.debug('Database batch processing disabled, using memory-only duplicate checking');
-            
-            // Clear pending inserts without processing
-            this.pendingBatch = [];
-            this.clearBatchTimer();
-            
-            return; // Skip all database batch operations
-            
-            // Original batch processing code disabled:
-            /*
-            if (!this.dbConnection || this.pendingInserts.length === 0) {
-                return;
-            }
-
-            this.clearBatchTimer();
-            
-            const batch = [...this.pendingInserts];
-            this.pendingInserts = [];
-
-            // Create table if not exists
-            await this.createDatabaseTable();
-
-            // Prepare batch insert
-            const values = batch.map(item => [
-                item.url,
-                item.urlHash,
-                item.contentHash || '',
-                item.siteId || null,
-                item.timestamp
-            ]);
-
-            if (values.length === 0) {
-                return;
-            }
-
-            const placeholders = values.map(() => '(?, ?, ?, ?, ?)').join(', ');
-            const query = `
-                INSERT IGNORE INTO ${this.tableName} 
-                (url, url_hash, content_hash, site_id, crawled_at) 
-                VALUES ${placeholders}
-            `;
-
-            const flatValues = values.flat();
-            
-            const result = await this.executeQuery(query, flatValues);
-            
-            this.stats.batchedInserts += batch.length;
-            
-            logger.debug('Batch processed successfully', { 
-                batchSize: batch.length,
-                totalBatched: this.stats.batchedInserts
-            });
-            */
-        } catch (error) {
-            logger.error('Error in batch processing (disabled)', { error: error.message });
-            // Clear pending to prevent accumulation
-            this.pendingBatch = [];
+            throw error;
         }
     }
 
@@ -666,9 +779,12 @@ class DuplicateChecker {
      */
     async batchCheckUrlsInDatabase(urls, siteId = null) {
         if (!this.dbConnection || !this.useDatabaseStorage || !Array.isArray(urls) || urls.length === 0) {
+            logger.warn('Batch DB duplicate check failed, falling back to in-memory only', {
+                service: 'crawler',
+                error: 'No database connection or empty URL list'
+            });
             return new Set();
         }
-        
         // Normalize and hash all URLs
         const urlHashes = urls.map(url => {
             try {
@@ -679,23 +795,18 @@ class DuplicateChecker {
                 return null;
             }
         }).filter(hash => hash !== null); // Remove any failed hashes
-        
         if (urlHashes.length === 0) {
             return new Set();
         }
-        
         // Remove duplicates
         const uniqueHashes = Array.from(new Set(urlHashes));
-        
         // Limit batch size to prevent query too long errors
         const maxBatchSize = 100;
         const batches = [];
         for (let i = 0; i < uniqueHashes.length; i += maxBatchSize) {
             batches.push(uniqueHashes.slice(i, i + maxBatchSize));
         }
-        
         const allResults = new Set();
-        
         for (const batch of batches) {
             let query, params;
             if (siteId) {
@@ -705,77 +816,104 @@ class DuplicateChecker {
                 query = `SELECT site_data_url_hash FROM site_data WHERE site_data_url_hash IN (${batch.map(() => '?').join(',')})`;
                 params = batch;
             }
-            
             try {
-                const rows = await this.dbConnection.query(query, params);
-                // Handle MySQL2 result structure - rows is directly the array
+                const [rows] = await this.dbConnection.query(query, params);
                 if (Array.isArray(rows) && rows.length > 0) {
                     rows.forEach(row => allResults.add(row.site_data_url_hash));
-                } else if (Array.isArray(rows) && rows.length === 0) {
-                    // Empty result set - no action needed
-                } else {
-                    // No results or unexpected structure - no action needed
                 }
             } catch (error) {
                 logger.error('Error in batchCheckUrlsInDatabase', { error: error.message });
                 // Continue with other batches even if one fails
             }
         }
-        
         return allResults;
     }
 
+    /**     
+     */
     async createDatabaseTable() {
         try {
             if (!this.dbConnection) {
                 logger.debug('No database connection, skipping table creation');
                 return;
             }
-
-            // We'll use the existing site_data table structure for duplicate checking
-            // No need to create a separate table since site_data already has the required fields:
-            // - site_data_url_hash (VARCHAR(64))
-            // - site_data_site_id (INT)
-            // - site_data_link (VARCHAR(2048))
-            // - status (for tracking duplicate check vs indexed)
             
             logger.info('Using existing site_data table for duplicate checking');
-            
-            // Ensure indexes exist for optimal performance
-            const indexQueries = [
-                `CREATE INDEX IF NOT EXISTS idx_url_hash_site ON site_data (site_data_url_hash, site_data_site_id)`,
-                `CREATE INDEX IF NOT EXISTS idx_url_hash ON site_data (site_data_url_hash)`,
-                `CREATE INDEX IF NOT EXISTS idx_status ON site_data (status)`
-            ];
-
-            for (const query of indexQueries) {
-                try {
-                    await this.dbConnection.query(query);
-                    logger.debug('Database index created/verified');
-                } catch (indexError) {
-                    logger.warn('Index creation failed (may already exist)', { 
-                        error: indexError.message 
-                    });
-                }
-            }
-
+            // Database indexes already exist, no need to create them
+            logger.debug('Database indexes already exist, skipping index creation');
         } catch (error) {
             logger.error('Error in database table setup', { error: error.message });
         }
     }
 
+    /**
+     * Execute database query
+     */
+    async executeQuery(query, params = []) {
+        try {
+            if (!this.dbConnection) {
+                logger.warn('Database connection not available, skipping query', { 
+                    query: query.substring(0, 100) + '...' 
+                });
+                return [];
+            }
+
+            let timeoutMs;
+            if (query.includes('INSERT') && query.includes('crawled_urls')) {
+                timeoutMs = 5000;
+            } else if (query.includes('crawled_urls')) {
+                timeoutMs = 10000;
+            } else {
+                timeoutMs = 15000;
+            }
+
+            const timeoutPromise = new Promise((_, reject) => {
+                setTimeout(() => {
+                    logger.error('Database query timeout', { 
+                        query: query.substring(0, 100) + '...',
+                        timeout: timeoutMs 
+                    });
+                    reject(new Error('Database query timeout'));
+                }, timeoutMs);
+            });
+
+            const queryPromise = this.dbConnection.query(query, params);
+            const results = await Promise.race([queryPromise, timeoutPromise]);
+            return results;
+        } catch (error) {
+            logger.error('Database query error', { 
+                query: query.substring(0, 100) + '...',
+                error: error.message,
+                code: error.code,
+                errno: error.errno
+            });
+            
+            if (query.includes('SELECT') && query.includes('crawled_urls')) {
+                logger.warn('crawled_urls table query failed, skipping duplicate check');
+                return [];
+            } else if (query.includes('INSERT') && query.includes('crawled_urls')) {
+                logger.warn('crawled_urls table INSERT failed, continuing without storage');
+                return [];
+            } else {
+                throw error;
+            }
+        }
+    }
+
+    /**
+     * Utility methods
+     */
     hashUrl(url) {
         try {
             return crypto.createHash('sha256').update(url).digest('hex');
         } catch (error) {
             logger.error('Error hashing URL', { url, error: error.message });
-            return url; // Fallback to original URL
+            return url;
         }
     }
 
     hashContent(content) {
         try {
-            // Normalize content before hashing
             const normalizedContent = this.normalizeContent(content);
             return crypto.createHash('sha256').update(normalizedContent).digest('hex');
         } catch (error) {
@@ -788,10 +926,8 @@ class DuplicateChecker {
         try {
             const urlObj = new URL(url);
             
-            // Remove fragment
             urlObj.hash = '';
             
-            // Remove common tracking parameters
             const trackingParams = [
                 'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
                 'fbclid', 'gclid', 'msclkid', 'ref', 'source'
@@ -801,10 +937,8 @@ class DuplicateChecker {
             trackingParams.forEach(param => params.delete(param));
             urlObj.search = params.toString();
             
-            // Normalize hostname
             urlObj.hostname = urlObj.hostname.toLowerCase();
             
-            // Remove trailing slash except for root
             if (urlObj.pathname !== '/') {
                 urlObj.pathname = urlObj.pathname.replace(/\/+$/, '');
             }
@@ -819,75 +953,21 @@ class DuplicateChecker {
     normalizeContent(content) {
         try {
             return content
-                .replace(/\s+/g, ' ')           // Normalize whitespace
-                .replace(/[\r\n\t]/g, ' ')      // Replace line breaks and tabs
-                .trim()                         // Remove leading/trailing whitespace
-                .toLowerCase();                 // Convert to lowercase for comparison
+                .replace(/\s+/g, ' ')
+                .replace(/[\r\n\t]/g, ' ')
+                .trim()
+                .toLowerCase();
         } catch (error) {
             logger.error('Error normalizing content', { error: error.message });
             return content;
         }
     }
 
-    async executeQuery(query, params = []) {
-        try {
-            if (!this.dbConnection) {
-                logger.warn('Database connection not available, skipping query', { 
-                    query: query.substring(0, 100) + '...' 
-                });
-                return []; // Return empty result instead of rejecting
-            }
-
-            // Use shorter timeouts to prevent blocking
-            let timeoutMs;
-            if (query.includes('INSERT') && query.includes('crawled_urls')) {
-                timeoutMs = 5000; // 5 seconds for INSERT operations (reduced from 30s)
-            } else if (query.includes('crawled_urls')) {
-                timeoutMs = 10000; // 10 seconds for other crawled_urls operations (reduced from 120s)
-            } else {
-                timeoutMs = 15000; // 15 seconds for other operations (reduced from 60s)
-            }
-
-            // Create a timeout promise
-            const timeoutPromise = new Promise((_, reject) => {
-                setTimeout(() => {
-                    logger.error('Database query timeout', { 
-                        query: query.substring(0, 100) + '...',
-                        timeout: timeoutMs 
-                    });
-                    reject(new Error('Database query timeout'));
-                }, timeoutMs);
-            });
-
-            // Create the query promise
-            const queryPromise = this.dbConnection.query(query, params);
-
-            // Race between query and timeout
-            const results = await Promise.race([queryPromise, timeoutPromise]);
-            return results;
-
-        } catch (error) {
-            logger.error('Database query error', { 
-                query: query.substring(0, 100) + '...',
-                error: error.message,
-                code: error.code,
-                errno: error.errno
-            });
-            
-            // For duplicate checking, return empty result instead of failing
-            if (query.includes('SELECT') && query.includes('crawled_urls')) {
-                logger.warn('crawled_urls table query failed, skipping duplicate check');
-                return [];
-            } else if (query.includes('INSERT') && query.includes('crawled_urls')) {
-                logger.warn('crawled_urls table INSERT failed, continuing without storage');
-                return []; // Don't throw for INSERT failures
-            } else {
-                throw error;
-            }
-        }
-    }
-
+    /**
+     * Get comprehensive statistics
+     */
     getStats() {
+        const bloomStats = this.bloomFilter.getStats();
         return {
             ...this.stats,
             cacheSize: {
@@ -895,228 +975,137 @@ class DuplicateChecker {
                 urlHashes: this.urlHashes.size,
                 contentHashes: this.contentHashes.size
             },
+            bloomFilter: bloomStats,
             duplicateRate: this.stats.totalChecked > 0 
                 ? (this.stats.duplicatesFound / this.stats.totalChecked * 100).toFixed(2) + '%'
-                : '0%'
+                : '0%',
+            falsePositiveRate: (this.stats.falsePositives / this.stats.totalChecked * 100).toFixed(2) + '%',
+            globalStats: this.globalStats,
+            activeSites: this.siteCaches.size
         };
     }
 
+    /**
+     * Get global statistics (alias for getStats for backward compatibility)
+     */
+    getGlobalStats() {
+        return this.getStats();
+    }
+
+    /**
+     * Get site-specific statistics
+     */
+    getSiteStats(siteId = null) {
+        const targetSiteId = siteId || this.currentSiteId;
+        if (!targetSiteId || !this.siteCaches.has(targetSiteId)) {
+            return null;
+        }
+        
+        return {
+            ...this.siteCaches.get(targetSiteId).stats,
+            cacheSize: this.siteCaches.get(targetSiteId).urlHashes.size
+        };
+    }
+
+    /**
+     * Clear all caches
+     */
     clearCache() {
         try {
             this.crawledUrls.clear();
             this.urlHashes.clear();
             this.contentHashes.clear();
+            this.bloomFilter.clear();
+            this.siteCaches.clear();
+            this.currentSiteId = null;
+            this.currentSiteStats = null;
             
-            logger.info('Duplicate checker cache cleared');
+            logger.info('All duplicate checker caches cleared');
         } catch (error) {
             logger.error('Error clearing cache', { error: error.message });
         }
     }
 
-    async flushPendingBatches() {
-        try {
-            if (this.pendingBatch.length > 0) {
-                logger.info('Flushing pending batches on shutdown', { 
-                    pendingCount: this.pendingBatch.length 
-                });
-                await this.processBatch();
+    /**
+     * Clear specific site cache
+     */
+    clearSiteCache(siteId) {
+        if (this.siteCaches.has(siteId)) {
+            this.siteCaches.delete(siteId);
+            if (this.currentSiteId === siteId) {
+                this.currentSiteId = null;
+                this.currentSiteStats = null;
             }
-        } catch (error) {
-            logger.error('Error flushing pending batches', { error: error.message });
+            logger.info('Site cache cleared', { siteId });
         }
     }
 
-    // Temporarily disable database storage to reduce load
+    /**
+     * Disable database storage
+     */
     disableDatabaseStorage() {
         this.useDatabaseStorage = false;
         logger.warn('Database storage disabled for duplicate checker to reduce DB load');
     }
 
-    // Re-enable database storage
+    /**
+     * Enable database storage
+     */
     enableDatabaseStorage() {
         this.useDatabaseStorage = true;
         logger.info('Database storage re-enabled for duplicate checker');
     }
 
-    async clearDatabase() {
-        try {
-            if (!this.dbConnection) {
-                throw new Error('Database connection not available');
-            }
-
-            const query = `DELETE FROM ${this.tableName}`;
-            await this.executeQuery(query);
-            
-            logger.info('Duplicate checker database cleared');
-        } catch (error) {
-            logger.error('Error clearing database', { error: error.message });
-            throw error;
-        }
-    }
-
-    async loadFromDatabase(limit = 10000) {
+    /**
+     * Load existing URLs from database into memory cache
+     */
+    async loadFromDatabase(limit = 2000) {
         try {
             if (!this.dbConnection) {
                 logger.debug('No database connection, skipping data load');
                 return;
             }
 
-            // Load existing URLs from site_data table
+            // Load existing URLs without expensive ORDER BY to avoid filesort
             const query = `
                 SELECT site_data_url_hash, site_data_link, site_data_site_id
                 FROM site_data 
                 WHERE site_data_url_hash IS NOT NULL
-                ORDER BY site_data_id DESC 
                 LIMIT ?
             `;
             
-            const results = await this.dbConnection.query(query, [limit]);
+            let results = await this.dbConnection.query(query, [limit], { timeout: 8000 });
+            // Normalize driver return shape
+            if (Array.isArray(results) && Array.isArray(results[0])) {
+                results = results[0];
+            }
             
             // Add URLs to memory cache for fast lookups
-            if (results && results.length > 0) {
-                results.forEach(row => {
+            if (Array.isArray(results) && results.length > 0) {
+                for (const row of results) {
                     this.urlHashes.add(row.site_data_url_hash);
                     this.crawledUrls.add(row.site_data_link);
-                    
-                    // Also add site-specific hash for better isolation
                     if (row.site_data_site_id) {
                         this.urlHashes.add(`${row.site_data_url_hash}:${row.site_data_site_id}`);
                     }
-                });
+                }
             }
             
             logger.info('Loaded duplicate data from database', { 
-                loaded: results ? results.length : 0,
+                loaded: Array.isArray(results) ? results.length : 0,
                 limit,
                 totalInMemory: this.urlHashes.size
             });
 
         } catch (error) {
+            if (String(error.message || '').toLowerCase().includes('timeout')) {
+                logger.warn('Timeout while loading duplicate data; continuing with partial/empty cache', { limit });
+                return;
+            }
             logger.error('Error loading duplicate data from database', { 
                 error: error.message 
             });
             // Continue with empty cache if loading fails
-        }
-    }
-
-    // Method to check similarity between content (for near-duplicate detection)
-    calculateContentSimilarity(content1, content2) {
-        try {
-            if (!content1 || !content2) return 0;
-            
-            const normalized1 = this.normalizeContent(content1);
-            const normalized2 = this.normalizeContent(content2);
-            
-            // Simple Jaccard similarity using word sets
-            const words1 = new Set(normalized1.split(' ').filter(w => w.length > 2));
-            const words2 = new Set(normalized2.split(' ').filter(w => w.length > 2));
-            
-            const intersection = new Set([...words1].filter(w => words2.has(w)));
-            const union = new Set([...words1, ...words2]);
-            
-            return union.size > 0 ? intersection.size / union.size : 0;
-        } catch (error) {
-            logger.error('Error calculating content similarity', { error: error.message });
-            return 0;
-        }
-    }
-
-    /**
-     * Find URLs that are NOT in the database (for discovering new content)
-     * @param {string[]} urls - Array of URLs to check
-     * @param {number|null} siteId - Optional site ID for site-specific check
-     * @returns {Promise<string[]>} - Array of URLs that are NOT in the database
-     */
-    async findNewUrls(urls, siteId = null) {
-        if (!this.dbConnection || !this.useDatabaseStorage || !Array.isArray(urls) || urls.length === 0) {
-            return urls; // Return all URLs if no DB check possible
-        }
-        
-        try {
-            // Normalize and hash all URLs
-            const urlHashes = urls.map(url => {
-                try {
-                    const normalizedUrl = this.normalizeUrls ? this.normalizeUrl(url) : url;
-                    return this.hashUrl(normalizedUrl);
-                } catch (error) {
-                    logger.warn('Error hashing URL in findNewUrls', { url, error: error.message });
-                    return null;
-                }
-            }).filter(hash => hash !== null);
-            
-            if (urlHashes.length === 0) {
-                return [];
-            }
-            
-            // Remove duplicates
-            const uniqueHashes = Array.from(new Set(urlHashes));
-            
-            // Create URL to hash mapping for reverse lookup
-            const urlToHash = new Map();
-            urls.forEach((url, index) => {
-                if (urlHashes[index]) {
-                    urlToHash.set(url, urlHashes[index]);
-                }
-            });
-            
-            // Process in batches to avoid query limits
-            const batchSize = 100;
-            const newUrls = [];
-            
-            for (let i = 0; i < uniqueHashes.length; i += batchSize) {
-                const batch = uniqueHashes.slice(i, i + batchSize);
-                
-                let query, params;
-                if (siteId) {
-                    query = `SELECT site_data_url_hash FROM site_data WHERE site_data_url_hash IN (${batch.map(() => '?').join(',')}) AND site_data_site_id = ?`;
-                    params = [...batch, siteId];
-                } else {
-                    query = `SELECT site_data_url_hash FROM site_data WHERE site_data_url_hash IN (${batch.map(() => '?').join(',')})`;
-                    params = batch;
-                }
-                
-                try {
-                    const rows = await this.dbConnection.query(query, params);
-                    
-                    // Handle MySQL2 result structure - rows is directly the array
-                    let existingHashes;
-                    if (Array.isArray(rows) && rows.length > 0) {
-                        existingHashes = new Set(rows.map(row => row.site_data_url_hash));
-                    } else if (Array.isArray(rows) && rows.length === 0) {
-                        // Empty result set
-                        existingHashes = new Set();
-                    } else {
-                        // No results or unexpected structure
-                        existingHashes = new Set();
-                    }
-                    
-                    // Find URLs that are NOT in the database
-                    for (const [url, hash] of urlToHash) {
-                        if (!existingHashes.has(hash)) {
-                            newUrls.push(url);
-                        }
-                    }
-                    
-                } catch (error) {
-                    logger.error('Error in findNewUrls batch query', { 
-                        batchIndex: Math.floor(i / batchSize), 
-                        error: error.message 
-                    });
-                    // Continue with other batches
-                }
-            }
-            
-            logger.debug('New URLs found', { 
-                totalChecked: urls.length, 
-                newUrlsFound: newUrls.length,
-                siteId 
-            });
-            
-            return newUrls;
-            
-        } catch (error) {
-            logger.error('Error in findNewUrls', { error: error.message });
-            return urls; // Return all URLs if check fails
         }
     }
 }
@@ -1124,4 +1113,8 @@ class DuplicateChecker {
 // Create singleton instance
 const duplicateChecker = new DuplicateChecker();
 
-module.exports = { duplicateChecker, DuplicateChecker }; 
+module.exports = { 
+    BloomFilter, 
+    DuplicateChecker, 
+    duplicateChecker 
+};

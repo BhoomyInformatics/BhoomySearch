@@ -15,7 +15,7 @@ const config = {
     host: 'localhost',
     user: 'mybhoomy_admin',
     password: 'mhQjj.%C-_LO_U4',
-    database: 'mybhoomy_mysearch',
+    database: 'mybhoomy_mytest',
     port: 3306,
     connectionLimit: 50, // Connection pool size
     acquireTimeout: 60000,

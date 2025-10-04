@@ -18,14 +18,13 @@ const { ContentTypeHandler } = require('./handlers/contentTypeHandler');
 
 const { urlValidator } = require('./utils/urlValidator');
 const { duplicateChecker } = require('./utils/duplicateChecker');
-const { SiteAwareDuplicateChecker } = require('./utils/siteAwareDuplicateChecker');
 const { resourceMonitor } = require('./utils/resource-monitor');
 const { logger } = require('./utils/logger');
 const { ImageDuplicateChecker } = require('./utils/imageDuplicateChecker');
 
 
 const { crawlerConfig } = require('./config/crawlerConfig');
-// elasticConfig removed - no longer needed for crawling process
+
 
 /**
  * Main Crawler Class - Orchestrates the entire crawling process
@@ -50,7 +49,7 @@ class SearchEngineCrawler {
         
         // Set up duplicate checker with database connection
         duplicateChecker.setDatabaseConnection(dbConnection);
-        
+       
         // Enhanced Statistics with Site Tracking
         this.stats = {
             totalProcessed: 0,
@@ -568,10 +567,13 @@ class SearchEngineCrawler {
                 maxPagesPerDomain: options.maxPagesPerDomain || this.options.maxPagesPerDomain
             });
             
-            // Create crawler instance
+            // Create crawler instance with production-friendly options
             const crawler = new CrawlerCore({ site_url: rootUrl, site_id: siteId }, this.dbConnection, {
                 ...this.options,
-                ...options
+                ...options,
+                // PRODUCTION FIX: Allow re-crawling of existing content for freshness
+                allowRecrawl: true,
+                maxAge: 30 * 24 * 60 * 60 * 1000 // 30 days in milliseconds
             });
             
             // Start with root URL

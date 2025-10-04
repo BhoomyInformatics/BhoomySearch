@@ -24,6 +24,30 @@ class ImageHandler {
             // Map to database row format
             crawlerInstance.site_data_db_row = this.mapToDbRow(imageData, url);
 
+            // Attempt to persist directly via ContentIndexer when available
+            if (crawlerInstance.contentIndexer && typeof crawlerInstance.contentIndexer.indexImageDirectly === 'function') {
+                try {
+                    const siteId = (crawlerInstance.smartStats && crawlerInstance.smartStats.siteId) || crawlerInstance.db_row?.site_id || 1;
+                    const urlHash = require('crypto').createHash('sha256').update(url).digest('hex');
+                    const result = await crawlerInstance.contentIndexer.indexImageDirectly(
+                        {
+                            title: imageData.title,
+                            alt: imageData.title,
+                            contentType: `image/${imageData.format}`,
+                            contentLength: imageData.fileSize,
+                            width: imageData.metadata.width,
+                            height: imageData.metadata.height
+                        },
+                        url,
+                        siteId,
+                        urlHash
+                    );
+                    logger.debug('Image indexed via ContentIndexer', { url, siteId, insertId: result.insertId, isDuplicate: result.isDuplicate });
+                } catch (indexErr) {
+                    logger.warn('Failed to index image via ContentIndexer, continuing without blocking', { url, error: indexErr.message });
+                }
+            }
+
             logger.info('Image processing completed', { 
                 url,
                 format: imageData.format,

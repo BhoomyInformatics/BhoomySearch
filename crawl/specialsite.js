@@ -28,15 +28,14 @@ class Server {
     constructor() {
         this.sitesCount = null;
         this.crawlList = [];
-        this.fetchBatchSize = 200; // window size
-        this.subBatchSize = 20;    // sub-batch size
+        this.parPage = 20; // Number of sites to crawl per page
         this.specialUrls = [];
 
         this.crawler = new SearchEngineCrawler(con, {
             maxDepth: 3,
-            maxPagesPerDomain: 250,   // Your setting: 250 pages per domain
+            maxPagesPerDomain: 1000,   // Your setting: 1000 pages per domain
             batchSize: 10,            // Your setting: 10 URLs concurrent per depth
-            maxPages: 250,            // Your setting: 250 pages max queue size
+            maxPages: 500,            // Your setting: 500 pages max queue size
             batchDelay: 2000,
             depthDelay: 3000,
             respectRobots: true,
@@ -245,50 +244,25 @@ class Server {
             // Create parameters with wildcards for LIKE query
             const domainParams = this.specialUrls.map(domain => `%${domain}%`);
 
-            let batchNumber = 0;
-            while (true) {
-                batchNumber++;
+            for (let i = 0; i < Math.ceil(this.sitesCount / this.parPage); i++) {
+                console.log(`Processing batch ${i + 1} of ${Math.ceil(this.sitesCount / this.parPage)}`);
+                
                 const rows = await con.query(`
-                    SELECT site_id, site_url FROM sites
+                    SELECT * FROM sites
                     WHERE (${domainConditions})
                         AND site_active = 1
                         AND site_locked = 0
                     ORDER BY site_last_crawl_date ASC
-                    LIMIT ${this.fetchBatchSize}
+                    LIMIT ${this.parPage * i}, ${this.parPage}
                 `, domainParams);
 
-                const count = rows ? rows.length : 0;
-                if (!rows || count === 0) {
-                    console.log('No more sites to process');
-                    break;
+                if (rows.length === 0) {
+                    console.log('No more sites to process in this batch');
+                    continue;
                 }
 
-                console.log(`Processing window ${batchNumber} — fetched ${count} sites (max ${this.fetchBatchSize})`);
-
-                const ids = rows.map(r => r.site_id).join(',');
-                await con.query(`
-                    UPDATE sites
-                    SET site_locked = 1,
-                        locked_by = '${script_id}',
-                        site_last_crawl_date = '${new Date().toISOString().replace(/T/, ' ').replace(/\..+/, '')}'
-                    WHERE site_id IN (${ids}) AND site_locked = 0
-                `);
-
-                const lockedRows = await con.query(`
-                    SELECT * FROM sites
-                    WHERE locked_by = '${script_id}' AND site_id IN (${ids})
-                    ORDER BY site_last_crawl_date ASC
-                `);
-
-                console.log(`Locked ${lockedRows ? lockedRows.length : 0} sites for this window`);
-
-                for (let start = 0; start < lockedRows.length; start += this.subBatchSize) {
-                    const slice = lockedRows.slice(start, start + this.subBatchSize);
-                    console.log(`Processing sub-batch ${Math.floor(start / this.subBatchSize) + 1} of ${Math.ceil(lockedRows.length / this.subBatchSize)} (size ${slice.length})`);
-                    await this.promissAll(slice);
-                }
-
-                await this.unlockSites(lockedRows);
+                console.log(`Found ${rows.length} sites to process in this batch`);
+                await this.promissAll(rows);
             }
             
             // Cleanup after all crawling is done
@@ -312,15 +286,26 @@ class Server {
                     WHERE site_id = ${site.site_id}
                 `);
 
-                // Use enhanced crawler to crawl entire website instead of just main page
-                const crawlPromise = this.crawler.crawlWebsite(site.site_url, site.site_id, {
+                // Use SMART crawler instead of regular crawler to handle duplicates properly
+                const crawlPromise = this.crawler.crawlWebsiteSmart(site.site_url, site.site_id, {
                     maxDepth: 3,
-                    maxPages: 250 // Your setting: 250 pages per site maximum
+                    maxPagesPerDomain: 1000, // This limit now applies only to NEW URLs
+                    forceCrawl: true, // Always crawl for new URLs regardless of existing count
+                    skipRecentCheck: true // Skip recent crawl checks to allow continuous growth
                 }).then(result => {
-                    console.log(`✅ Website crawl completed for ${site.site_url}: ${result.totalPages} pages crawled`);
+                    if (result.reason) {
+                        console.log(`⏭️ Site skipped: ${site.site_url} - ${result.reason}`);
+                        console.log(`   Message: ${result.message}`);
+                    } else {
+                        console.log(`✅ Smart crawl completed for ${site.site_url}:`);
+                        console.log(`   📄 New pages indexed: ${result.uniquePages}`);
+                        console.log(`   🔄 Duplicates skipped: ${result.duplicatesSkipped}`);
+                        console.log(`   💾 HTTP requests saved: ${result.httpRequestsSaved}`);
+                        console.log(`   📊 Efficiency: ${result.crawlEfficiency}%`);
+                    }
                     return result;
                 }).catch(error => {
-                    console.error(`⚠ Crawl failed for ${site.site_url}:`, error.message);
+                    console.error(`⚠ Smart crawl failed for ${site.site_url}:`, error.message);
                     return { success: false, url: site.site_url, error: error.message };
                 });
 

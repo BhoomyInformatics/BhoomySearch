@@ -32,6 +32,23 @@ class HtmlHandler {
             crawlerInstance.$ = cheerio.load(htmlContent);
             crawlerInstance.site_data_db_row = this.mapToDbRow(parsedData, url);
 
+            // Media persistence is handled by the indexer AFTER page insert so that
+            // a valid `site_data_id` is available. Avoid preemptive media inserts here.
+            // If you intentionally want pre-insert media persistence, enable via env flag.
+            try {
+                const prefetchEnabled = process.env.PREFETCH_MEDIA_BEFORE_PAGE_INSERT === 'true';
+                if (prefetchEnabled) {
+                    const siteId = (crawlerInstance.smartStats && crawlerInstance.smartStats.siteId) || crawlerInstance.db_row?.site_id || null;
+                    // Only prefetch when we already have a known site_data_id
+                    const siteDataId = crawlerInstance.lastInsertedSiteDataId || null;
+                    if (siteId && siteDataId && crawlerInstance.contentIndexer && typeof crawlerInstance.contentIndexer.insertMediaItems === 'function') {
+                        await crawlerInstance.contentIndexer.insertMediaItems(parsedData, siteId, siteDataId, url);
+                    }
+                }
+            } catch (mediaPrefetchErr) {
+                logger.debug('Media prefetch disabled or failed (non-blocking)', { url, error: mediaPrefetchErr.message });
+            }
+
             // Extract additional links for further crawling
             const extractedLinks = this.extractCrawlableLinks(parsedData.links, url, crawlerInstance);
             

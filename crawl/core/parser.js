@@ -2,6 +2,74 @@ const cheerio = require('cheerio');
 const { JSDOM } = require('jsdom');
 const { logger } = require('../utils/logger');
 
+/**
+ * LRU Cache implementation for URL normalization to prevent memory leaks
+ */
+class LRUCache {
+    constructor(maxSize = 10000) {
+        this.maxSize = maxSize;
+        this.cache = new Map();
+        this.accessOrder = new Map();
+        this.accessCounter = 0;
+    }
+    
+    set(key, value) {
+        // If key already exists, update it
+        if (this.cache.has(key)) {
+            this.cache.set(key, value);
+            this.accessOrder.set(key, ++this.accessCounter);
+            return;
+        }
+        
+        // If cache is full, remove least recently used item
+        if (this.cache.size >= this.maxSize) {
+            this.evictLRU();
+        }
+        
+        this.cache.set(key, value);
+        this.accessOrder.set(key, ++this.accessCounter);
+    }
+    
+    get(key) {
+        if (this.cache.has(key)) {
+            this.accessOrder.set(key, ++this.accessCounter);
+            return this.cache.get(key);
+        }
+        return undefined;
+    }
+    
+    has(key) {
+        return this.cache.has(key);
+    }
+    
+    evictLRU() {
+        let oldestKey = null;
+        let oldestAccess = Infinity;
+        
+        for (const [key, accessTime] of this.accessOrder) {
+            if (accessTime < oldestAccess) {
+                oldestAccess = accessTime;
+                oldestKey = key;
+            }
+        }
+        
+        if (oldestKey) {
+            this.cache.delete(oldestKey);
+            this.accessOrder.delete(oldestKey);
+        }
+    }
+    
+    clear() {
+        this.cache.clear();
+        this.accessOrder.clear();
+        this.accessCounter = 0;
+    }
+    
+    size() {
+        return this.cache.size;
+    }
+}
+
 class ContentParser {
     constructor() {
         this.maxContentLength = {
@@ -16,16 +84,29 @@ class ContentParser {
         };
         // Flag to reduce base64 URL logging
         this.base64UrlLogged = false;
+        
+        // Initialize LRU cache for URL normalization to prevent memory leaks
+        this.urlCache = new LRUCache(5000); // Cache up to 5000 normalized URLs
+        this.parsedContentCache = new LRUCache(1000); // Cache up to 1000 parsed content objects
+        
+        // Memory monitoring
+        this.lastMemoryCheck = Date.now();
+        this.memoryCheckInterval = 30000; // Check every 30 seconds
     }
 
     /**
      * Safely decode URL with infinite loop protection and comprehensive validation
-     * This should be used for all URL processing in the parser
+     * Enhanced with LRU caching to prevent memory leaks
      */
     normalizeUrl(url) {
         // Input validation
         if (!url || typeof url !== 'string') {
             return url || '';
+        }
+
+        // Check cache first to prevent redundant processing
+        if (this.urlCache.has(url)) {
+            return this.urlCache.get(url);
         }
 
         // URL length validation to prevent memory issues
@@ -40,7 +121,9 @@ class ContentParser {
         // Basic URL format validation
         if (!this.isValidUrlFormat(url)) {
             logger.warn('Invalid URL format detected, using fallback handling', { url: url.substring(0, 100) });
-            return this.fallbackUrlHandler(url);
+            const fallbackResult = this.fallbackUrlHandler(url);
+            this.urlCache.set(url, fallbackResult);
+            return fallbackResult;
         }
 
         try {
@@ -58,7 +141,9 @@ class ContentParser {
                 decodedUrl = decodeURIComponent(url);
             } catch (decodeError) {
                 logger.debug('Initial URL decoding failed, using original', { url: url.substring(0, 100) });
-                return url.trim();
+                const result = url.trim();
+                this.urlCache.set(url, result);
+                return result;
             }
             
             // Handle any remaining encoded characters with strict loop protection
@@ -117,20 +202,66 @@ class ContentParser {
             
             // Final validation and cleanup
             const result = decodedUrl.trim();
-            return this.validateDecodedUrl(result, url);
+            const validatedResult = this.validateDecodedUrl(result, url);
+            
+            // Cache the result to prevent future redundant processing
+            this.urlCache.set(url, validatedResult);
+            
+            // Periodic memory monitoring
+            this.checkMemoryUsage();
+            
+            return validatedResult;
             
         } catch (error) {
             logger.warn('Error normalizing URL, using fallback handler', { 
                 url: url.substring(0, 100), 
                 error: error.message 
             });
-            return this.fallbackUrlHandler(url);
+            const fallbackResult = this.fallbackUrlHandler(url);
+            this.urlCache.set(url, fallbackResult);
+            return fallbackResult;
         }
     }
 
     /**
-     * Validate URL format before processing
+     * Check memory usage and clean caches if needed
      */
+    checkMemoryUsage() {
+        const now = Date.now();
+        if (now - this.lastMemoryCheck < this.memoryCheckInterval) {
+            return;
+        }
+        
+        this.lastMemoryCheck = now;
+        
+        try {
+            const memUsage = process.memoryUsage();
+            const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+            const rssMB = Math.round(memUsage.rss / 1024 / 1024);
+            
+            // If memory usage is high, clean caches
+            if (heapUsedMB > 500 || rssMB > 1000) { // 500MB heap or 1GB RSS
+                logger.warn('High memory usage detected, cleaning caches', {
+                    heapUsedMB,
+                    rssMB,
+                    urlCacheSize: this.urlCache.size(),
+                    contentCacheSize: this.parsedContentCache.size()
+                });
+                
+                // Clear half of the cache to free memory
+                this.urlCache.clear();
+                this.parsedContentCache.clear();
+                
+                // Force garbage collection if available
+                if (global.gc) {
+                    global.gc();
+                    logger.info('Forced garbage collection after cache cleanup');
+                }
+            }
+        } catch (error) {
+            logger.warn('Error checking memory usage', { error: error.message });
+        }
+    }
     isValidUrlFormat(url) {
         try {
             // Basic format checks
@@ -331,13 +462,11 @@ class ContentParser {
         try {
             let title = '';
             
-            // Try different title sources in order of preference
+            // Try different title sources in order of preference - AVOID using headings to prevent duplication
             const titleSources = [
                 'title',
                 'meta[property="og:title"]',
                 'meta[name="twitter:title"]',
-                'h1',
-                'h2', // Add more fallbacks
                 '.title',
                 '.page-title',
                 '.post-title',
@@ -347,7 +476,7 @@ class ContentParser {
             for (const selector of titleSources) {
                 const element = $(selector).first();
                 if (element.length > 0) {
-                    title = (selector === 'title' || selector.startsWith('h') || selector.startsWith('.'))
+                    title = (selector === 'title' || selector.startsWith('.'))
                         ? element.text().trim()
                         : element.attr('content')?.trim() || '';
                     
@@ -404,11 +533,23 @@ class ContentParser {
                 }
             }
 
-            // If still no description, try to extract from first paragraph
+            // If still no description, try to extract from first paragraph (AVOID using title to prevent duplication)
             if (!description) {
                 const firstParagraph = $('p').first().text().trim();
                 if (firstParagraph.length > 50) {
                     description = firstParagraph;
+                }
+            }
+
+            // Final fallback: use first meaningful content paragraph (not title)
+            if (!description) {
+                const contentParagraphs = $('p').filter((i, el) => {
+                    const text = $(el).text().trim();
+                    return text.length > 30 && !text.includes('©') && !text.includes('Copyright');
+                });
+                
+                if (contentParagraphs.length > 0) {
+                    description = contentParagraphs.first().text().trim();
                 }
             }
 
@@ -428,17 +569,43 @@ class ContentParser {
         try {
             let keywords = '';
             
-            // Extract from meta keywords
+            // Extract from meta keywords first
             const metaKeywords = $('meta[name="keywords"]').attr('content');
             if (metaKeywords) {
                 keywords = metaKeywords.trim();
             }
 
-            // If no meta keywords, extract from headings and strong text
+            // If no meta keywords, extract from meaningful content (AVOID duplicating title/headings)
             if (!keywords) {
-                const headingText = $('h1, h2, h3').map((i, el) => $(el).text().trim()).get().join(' ');
-                const strongText = $('strong, b').map((i, el) => $(el).text().trim()).get().join(' ');
-                keywords = `${headingText} ${strongText}`.trim();
+                // Extract from meta tags and structured data instead of headings
+                const metaTags = [
+                    'meta[property="article:tag"]',
+                    'meta[name="news_keywords"]',
+                    'meta[property="og:keywords"]',
+                    'meta[name="twitter:keywords"]'
+                ];
+                
+                const extractedTags = [];
+                for (const selector of metaTags) {
+                    const content = $(selector).attr('content');
+                    if (content && content.trim()) {
+                        extractedTags.push(content.trim());
+                    }
+                }
+                
+                if (extractedTags.length > 0) {
+                    keywords = extractedTags.join(', ');
+                } else {
+                    // Fallback: extract from strong/em tags and meaningful content (not headings)
+                    const strongText = $('strong, b, em, .tag, .keyword, .category').map((i, el) => {
+                        const text = $(el).text().trim();
+                        return text.length > 2 && text.length < 50 ? text : '';
+                    }).get().filter(text => text).join(', ');
+                    
+                    if (strongText) {
+                        keywords = strongText;
+                    }
+                }
             }
 
             keywords = this.sanitizeText(keywords);
@@ -617,15 +784,17 @@ class ContentParser {
                 h4: ''
             };
 
-            // Extract each heading level
+            // Extract each heading level with better deduplication
             for (const level of ['h1', 'h2', 'h3', 'h4']) {
                 let headingText = '';
                 const maxLength = this.maxContentLength[level];
+                const seenTexts = new Set(); // Track seen texts to avoid duplicates
                 
                 $(level).each((index, element) => {
                     if (headingText.length < maxLength) {
                         const text = $(element).text().trim();
-                        if (text) {
+                        if (text && !seenTexts.has(text.toLowerCase())) {
+                            seenTexts.add(text.toLowerCase());
                             const cleanText = text.replace(/'/g, '').replace(/\s+/g, ' ');
                             const addition = cleanText + ', ';
                             
@@ -928,13 +1097,38 @@ class ContentParser {
             const images = [];
             const seenUrls = new Set();
 
-            $('img[src]').each((index, element) => {
+            // Helper to push a URL once
+            const pushImage = (absoluteUrl, alt = '', title = '', width = '', height = '') => {
+                if (!absoluteUrl) return;
+                if (seenUrls.has(absoluteUrl)) return;
+                seenUrls.add(absoluteUrl);
+                images.push({
+                    url: absoluteUrl,
+                    alt: String(alt || '').substring(0, 255),
+                    title: String(title || '').substring(0, 255),
+                    width: width || '',
+                    height: height || ''
+                });
+            };
+
+            // Standard <img> tags (src, data-src, srcset)
+            $('img').each((index, element) => {
                 let src; // Declare src at the beginning so it's available in catch block
                 try {
-                    src = $(element).attr('src');
-                    const alt = $(element).attr('alt') || '';
-                    const title = $(element).attr('title') || '';
-                    
+                    const $el = $(element);
+                    src = $el.attr('src') || $el.attr('data-src') || '';
+                    let alt = $el.attr('alt') || '';
+                    let title = $el.attr('title') || '';
+                    let width = $el.attr('width') || '';
+                    let height = $el.attr('height') || '';
+
+                    // Fallback: take first candidate from srcset
+                    if (!src) {
+                        const srcset = $el.attr('srcset') || '';
+                        const candidate = srcset.split(',').map(s => s.trim().split(' ')[0]).find(Boolean);
+                        if (candidate) src = candidate;
+                    }
+
                     if (!src) return;
 
                     // Skip base64 data URLs, blob URLs, and other invalid image URLs efficiently
@@ -951,23 +1145,34 @@ class ContentParser {
 
                     // Resolve relative URLs
                     const absoluteUrl = new URL(src, baseUrl).toString();
-                    
-                    // Avoid duplicates
-                    if (seenUrls.has(absoluteUrl)) {
-                        return;
-                    }
-                    seenUrls.add(absoluteUrl);
-
-                    images.push({
-                        url: absoluteUrl,
-                        alt: alt.substring(0, 255),
-                        title: title.substring(0, 255),
-                        width: $(element).attr('width') || '',
-                        height: $(element).attr('height') || ''
-                    });
+                    pushImage(absoluteUrl, alt, title, width, height);
                 } catch (urlError) {
                     logger.debug('Invalid image URL found', { src: src || 'undefined' });
                 }
+            });
+
+            // Anchors linking directly to image files
+            $('a[href]').each((_, el) => {
+                try {
+                    const href = $(el).attr('href');
+                    if (!href) return;
+                    if (/\.(jpe?g|png|gif|bmp|webp|svg|tiff?|ico)(?:\?|$)/i.test(href)) {
+                        const absoluteUrl = new URL(href, baseUrl).toString();
+                        pushImage(absoluteUrl, $(el).attr('title') || '');
+                    }
+                } catch (_) {}
+            });
+
+            // Elements with CSS background-image
+            $('[style*="background-image"]').each((_, el) => {
+                try {
+                    const style = $(el).attr('style') || '';
+                    const match = style.match(/background-image\s*:\s*url\(("|')?(.*?)\1\)/i);
+                    const urlCandidate = match ? match[2] : '';
+                    if (!urlCandidate) return;
+                    const absoluteUrl = new URL(urlCandidate, baseUrl).toString();
+                    pushImage(absoluteUrl);
+                } catch (_) {}
             });
 
             return images;
@@ -1097,7 +1302,7 @@ class ContentParser {
                         if (seenUrls.has(absoluteUrl)) return;
                         seenUrls.add(absoluteUrl);
 
-                        const match = src.match(/\\.([a-zA-Z0-9]+)(?:\\?|$)/);
+                        const match = src.match(/\.([a-zA-Z0-9]+)(?:\?|$)/);
                         const fileType = match ? match[1].toLowerCase() : 'unknown';
 
                         documents.push({
@@ -1113,10 +1318,22 @@ class ContentParser {
                 }
             });
 
-            logger.debug('Documents extracted', { 
-                count: documents.length,
-                types: [...new Set(documents.map(doc => doc.type))]
+            // Also consider attachment-style link tags
+            $('link[rel="attachment"], link[rel="alternate"][type*="pdf"]').each((_, el) => {
+                try {
+                    const href = $(el).attr('href');
+                    if (!href) return;
+                    if (docPattern.test(href)) {
+                        const absoluteUrl = new URL(href, baseUrl).toString();
+                        if (!seenUrls.has(absoluteUrl)) {
+                            seenUrls.add(absoluteUrl);
+                            documents.push({ url: absoluteUrl, title: $(el).attr('title') || '', type: 'AUTO' });
+                        }
+                    }
+                } catch (_) {}
             });
+
+            logger.debug('Documents extracted', { count: documents.length });
 
             return documents;
         } catch (error) {

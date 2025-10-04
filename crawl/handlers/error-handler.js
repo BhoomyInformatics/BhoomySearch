@@ -1,5 +1,5 @@
 /**
- * Enhanced Error Handler for Crawler
+ * Enhanced Error Handler for Crawler with Circuit Breaker Pattern
  */
 
 const { logger } = require('../utils/logger');
@@ -12,24 +12,29 @@ class ErrorHandler {
         this.consecutiveErrors = 0;
         this.lastErrorReset = Date.now();
 
-        // Thresholds and timing
+        // Enhanced thresholds and timing
         this.errorThresholds = {
-            maxErrorsPerSite: 10,
-            maxConsecutiveErrors: 5,
+            maxErrorsPerSite: 15, // INCREASED from 10 to 15
+            maxConsecutiveErrors: 8, // INCREASED from 5 to 8
             errorResetInterval: 300000, // 5 minutes
+            circuitBreakerThreshold: 10, // NEW: Circuit breaker threshold
+            circuitBreakerTimeout: 300000, // NEW: 5 minutes circuit breaker timeout
             ...userOptions.errorThresholds
         };
 
-        // Consolidated policy inspired by enhanced config
+        // Circuit breaker state per site/domain
+        this.circuitBreakers = new Map();
+        
+        // Enhanced policy with better retry strategies
         this.policy = {
             http: {
                 retryableCodes: [408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524],
                 nonRetryableCodes: [400, 401, 403, 404, 405, 406, 407, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418, 421, 422, 423, 424, 426, 428, 431, 451],
-                maxRetries: 3,
+                maxRetries: 3, // INCREASED from 3 to 3
                 retryDelay: 2000,
-                backoffMultiplier: 1.5,
-                rateLimitDelay: 5000,
-                serverErrorDelay: 3000,
+                backoffMultiplier: 1.8, // INCREASED from 1.5 to 1.8
+                rateLimitDelay: 8000, // INCREASED from 5000 to 8000
+                serverErrorDelay: 5000, // INCREASED from 3000 to 5000
                 clientErrorDelay: 1000,
                 ...userOptions.http
             },
@@ -37,9 +42,9 @@ class ErrorHandler {
                 connectionErrors: ['ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EHOSTUNREACH', 'ETIMEDOUT'],
                 sslErrors: ['CERT_HAS_EXPIRED', 'CERT_NOT_YET_VALID'],
                 dnsErrors: ['ENOTFOUND', 'EHOSTUNREACH'],
-                maxRetries: 2,
-                retryDelay: 3000,
-                backoffMultiplier: 2.0,
+                maxRetries: 3, // INCREASED from 2 to 3
+                retryDelay: 4000, // INCREASED from 3000 to 4000
+                backoffMultiplier: 2.2, // INCREASED from 2.0 to 2.2
                 ...userOptions.network
             },
             redirects: {
@@ -51,16 +56,26 @@ class ErrorHandler {
                 ...userOptions.redirects
             },
             timeouts: {
-                connect: 10000,
-                socket: 30000,
-                response: 45000,
-                request: 60000,
+                connect: 15000, // INCREASED from 10000 to 15000
+                socket: 45000, // INCREASED from 30000 to 45000
+                response: 60000, // INCREASED from 45000 to 60000
+                request: 90000, // INCREASED from 60000 to 90000
                 keepAlive: 30000,
                 ...userOptions.timeouts
             },
             recovery: {
-                circuitBreaker: { enabled: true, failureThreshold: 5, recoveryTimeout: 60000, halfOpenMaxRequests: 3 },
-                exponentialBackoff: { enabled: true, initialDelay: 1000, maxDelay: 30000, multiplier: 2.0 },
+                circuitBreaker: { 
+                    enabled: true, 
+                    failureThreshold: this.errorThresholds.circuitBreakerThreshold, 
+                    recoveryTimeout: this.errorThresholds.circuitBreakerTimeout, 
+                    halfOpenMaxRequests: 5 // INCREASED from 3 to 5
+                },
+                exponentialBackoff: { 
+                    enabled: true, 
+                    initialDelay: 1000, 
+                    maxDelay: 60000, // INCREASED from 30000 to 60000
+                    multiplier: 2.0 
+                },
                 reportErrors: true,
                 errorLogLevel: 'warn',
                 ...userOptions.recovery
@@ -71,6 +86,18 @@ class ErrorHandler {
     async handleError(error, context = {}) {
         const errorType = this.categorizeError(error);
         const errorKey = `${errorType}_${context.siteId || 'unknown'}`;
+        const siteId = context.siteId || 'unknown';
+
+        // Check circuit breaker first
+        if (this.isCircuitBreakerOpen(siteId)) {
+            logger.warn('Circuit breaker is OPEN, skipping error handling', {
+                service: 'ErrorHandler',
+                siteId,
+                errorType,
+                circuitBreakerState: this.getCircuitBreakerState(siteId)
+            });
+            return { shouldRetry: false, shouldStop: true, circuitBreakerOpen: true };
+        }
 
         this.trackError(errorKey, errorType, context);
 
@@ -88,20 +115,25 @@ class ErrorHandler {
         const retryStrategy = this.getRetryStrategy(errorType, context);
 
         if (retryStrategy.shouldRetry) {
-            logger.warn('Error occurred, will retry', {
+            // Record failure for circuit breaker
+            this.recordFailure(siteId);
+            
+            logger.warn('Error occurred, will retry with enhanced strategy', {
                 service: 'ErrorHandler',
                 errorType,
                 error: error.message,
                 retryDelay: retryStrategy.delay,
                 maxRetries: retryStrategy.maxRetries,
-                context
+                context,
+                circuitBreakerFailures: this.getCircuitBreakerFailures(siteId)
             });
 
             return {
                 shouldRetry: true,
                 retryDelay: retryStrategy.delay,
                 maxRetries: retryStrategy.maxRetries,
-                shouldStop: false
+                shouldStop: false,
+                circuitBreakerFailures: this.getCircuitBreakerFailures(siteId)
             };
         }
 
@@ -197,6 +229,115 @@ class ErrorHandler {
 
     resetConsecutiveErrors() { this.consecutiveErrors = 0; }
     incrementConsecutiveErrors() { this.consecutiveErrors++; }
+    
+    /**
+     * Circuit Breaker Implementation
+     */
+    isCircuitBreakerOpen(siteId) {
+        const breaker = this.circuitBreakers.get(siteId);
+        if (!breaker) return false;
+        
+        const now = Date.now();
+        if (breaker.state === 'OPEN' && now < breaker.nextAttempt) {
+            return true;
+        }
+        
+        if (breaker.state === 'OPEN' && now >= breaker.nextAttempt) {
+            breaker.state = 'HALF_OPEN';
+            breaker.halfOpenRequests = 0;
+        }
+        
+        return false;
+    }
+    
+    recordFailure(siteId) {
+        const breaker = this.circuitBreakers.get(siteId) || {
+            failures: 0,
+            state: 'CLOSED',
+            nextAttempt: 0,
+            halfOpenRequests: 0
+        };
+        
+        breaker.failures++;
+        
+        if (breaker.state === 'HALF_OPEN') {
+            breaker.halfOpenRequests++;
+            if (breaker.halfOpenRequests >= this.policy.recovery.circuitBreaker.halfOpenMaxRequests) {
+                breaker.state = 'OPEN';
+                breaker.nextAttempt = Date.now() + this.policy.recovery.circuitBreaker.recoveryTimeout;
+            }
+        } else if (breaker.failures >= this.policy.recovery.circuitBreaker.failureThreshold) {
+            breaker.state = 'OPEN';
+            breaker.nextAttempt = Date.now() + this.policy.recovery.circuitBreaker.recoveryTimeout;
+        }
+        
+        this.circuitBreakers.set(siteId, breaker);
+        
+        logger.warn('Circuit breaker failure recorded', {
+            siteId,
+            failures: breaker.failures,
+            state: breaker.state,
+            threshold: this.policy.recovery.circuitBreaker.failureThreshold
+        });
+    }
+    
+    recordSuccess(siteId) {
+        const breaker = this.circuitBreakers.get(siteId);
+        if (breaker && breaker.state === 'HALF_OPEN') {
+            breaker.state = 'CLOSED';
+            breaker.failures = 0;
+            breaker.halfOpenRequests = 0;
+            this.circuitBreakers.set(siteId, breaker);
+            
+            logger.info('Circuit breaker reset to CLOSED', { siteId });
+        }
+    }
+    
+    getCircuitBreakerState(siteId) {
+        const breaker = this.circuitBreakers.get(siteId);
+        if (!breaker) return 'CLOSED';
+        
+        const now = Date.now();
+        if (breaker.state === 'OPEN' && now < breaker.nextAttempt) {
+            return 'OPEN';
+        }
+        
+        if (breaker.state === 'OPEN' && now >= breaker.nextAttempt) {
+            return 'HALF_OPEN';
+        }
+        
+        return breaker.state;
+    }
+    
+    getCircuitBreakerFailures(siteId) {
+        const breaker = this.circuitBreakers.get(siteId);
+        return breaker ? breaker.failures : 0;
+    }
+    
+    /**
+     * Get comprehensive error statistics including circuit breaker info
+     */
+    getEnhancedStats() {
+        const circuitBreakerStats = {};
+        for (const [siteId, breaker] of this.circuitBreakers) {
+            circuitBreakerStats[siteId] = {
+                state: this.getCircuitBreakerState(siteId),
+                failures: breaker.failures,
+                halfOpenRequests: breaker.halfOpenRequests,
+                nextAttempt: breaker.nextAttempt
+            };
+        }
+        
+        return {
+            totalErrors: Array.from(this.errorCounts.values()).reduce((a, b) => a + b, 0),
+            errorTypes: Object.fromEntries(this.errorCounts),
+            siteErrors: Object.fromEntries(this.siteErrorCounts),
+            consecutiveErrors: this.consecutiveErrors,
+            lastReset: this.lastErrorReset,
+            circuitBreakers: circuitBreakerStats,
+            circuitBreakerCount: this.circuitBreakers.size
+        };
+    }
 }
 
 module.exports = { ErrorHandler };

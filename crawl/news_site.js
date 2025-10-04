@@ -28,8 +28,7 @@ class Server {
     constructor() {
         this.sitesCount = null;
         this.crawlList = [];
-        this.fetchBatchSize = 200; // window size
-        this.subBatchSize = 20;    // sub-batch size
+        this.parPage = 20; // Number of sites to crawl per page
         this.newsUrls = [];
 
         this.crawler = new SearchEngineCrawler(con, {
@@ -252,50 +251,25 @@ class Server {
             // Create parameters with wildcards for LIKE query
             const domainParams = this.newsUrls.map(domain => `%${domain}%`);
 
-            let batchNumber = 0;
-            while (true) {
-                batchNumber++;
+            for (let i = 0; i < Math.ceil(this.sitesCount / this.parPage); i++) {
+                console.log(`Processing batch ${i + 1} of ${Math.ceil(this.sitesCount / this.parPage)}`);
+                
                 const rows = await con.query(`
-                    SELECT site_id, site_url FROM sites
+                    SELECT * FROM sites
                     WHERE (${domainConditions})
                         AND site_active = 1
                         AND site_locked = 0
                     ORDER BY site_last_crawl_date ASC
-                    LIMIT ${this.fetchBatchSize}
+                    LIMIT ${this.parPage * i}, ${this.parPage}
                 `, domainParams);
 
-                const count = rows ? rows.length : 0;
-                if (!rows || count === 0) {
-                    console.log('No more sites to process');
-                    break;
+                if (rows.length === 0) {
+                    console.log('No more sites to process in this batch');
+                    continue;
                 }
 
-                console.log(`Processing window ${batchNumber} — fetched ${count} sites (max ${this.fetchBatchSize})`);
-
-                const ids = rows.map(r => r.site_id).join(',');
-                await con.query(`
-                    UPDATE sites
-                    SET site_locked = 1,
-                        locked_by = '${script_id}',
-                        site_last_crawl_date = '${new Date().toISOString().replace(/T/, ' ').replace(/\..+/, '')}'
-                    WHERE site_id IN (${ids}) AND site_locked = 0
-                `);
-
-                const lockedRows = await con.query(`
-                    SELECT * FROM sites
-                    WHERE locked_by = '${script_id}' AND site_id IN (${ids})
-                    ORDER BY site_last_crawl_date ASC
-                `);
-
-                console.log(`Locked ${lockedRows ? lockedRows.length : 0} sites for this window`);
-
-                for (let start = 0; start < lockedRows.length; start += this.subBatchSize) {
-                    const slice = lockedRows.slice(start, start + this.subBatchSize);
-                    console.log(`Processing sub-batch ${Math.floor(start / this.subBatchSize) + 1} of ${Math.ceil(lockedRows.length / this.subBatchSize)} (size ${slice.length})`);
-                    await this.promissAll(slice);
-                }
-
-                await this.unlockSites(lockedRows);
+                console.log(`Found ${rows.length} sites to process in this batch`);
+                await this.promissAll(rows);
             }
             
             // Cleanup after all crawling is done
@@ -322,7 +296,7 @@ class Server {
                 // Use SMART crawler to solve the duplicate URL problem
                 const crawlPromise = this.crawler.crawlWebsiteSmart(site.site_url, site.site_id, {
                     maxDepth: 3,
-                    maxPagesPerDomain: 1000, // This limit now applies only to NEW URLs (solves your problem!)
+                    maxPagesPerDomain: 1000, // This limit now applies only to NEW URLs
                     forceCrawl: true, // Force daily crawling for news sites
                     skipRecentCheck: true, // Skip the recent crawl check for news sites
                     crawlInterval: 'daily' // Ensure daily crawling
@@ -422,8 +396,8 @@ process.on('SIGTERM', handleExit);  // Termination signal (kill command)
 process.on('SIGHUP', handleExit);   // Hangup signal (terminal closed)
 process.on('SIGQUIT', handleExit);  // Quit signal
 
-// Schedule job to run every 10 hours (news sites need more frequent updates)
-schedule.scheduleJob('0 */10 * * *', function () {
+// Schedule job to run every 12 hours (news sites need more frequent updates)
+schedule.scheduleJob('0 */12 * * *', function () {
     console.log('Starting scheduled crawl...');
     const s = new Server();
     s.crawlerStart();

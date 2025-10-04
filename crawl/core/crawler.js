@@ -17,7 +17,6 @@ const systemLimitsManager = require('../config/system-limits');
 
 const { urlValidator } = require('../utils/urlValidator');
 const { duplicateChecker } = require('../utils/duplicateChecker');
-const { SiteAwareDuplicateChecker } = require('../utils/siteAwareDuplicateChecker');
 const { resourceMonitor } = require('../utils/resource-monitor');
 
 const { HtmlHandler } = require('../handlers/htmlHandler');
@@ -37,20 +36,34 @@ dns.setServers(['8.8.8.8', '1.1.1.1', '8.8.4.4']);
 const httpAgent = new http.Agent({
     keepAlive: true,
     keepAliveMsecs: 30000,
-    maxSockets: 200, // INCREASED from 100 to 200 to match maxGlobalConnections
-    maxFreeSockets: 100, // INCREASED from 50 to 100 for better connection reuse
-    timeout: 20000, // INCREASED from 15000 to 20000
-    scheduling: 'fifo'
+    maxSockets: 500, // INCREASED from 200 to 500 for better throughput
+    maxFreeSockets: 200, // INCREASED from 100 to 200 for better connection reuse
+    timeout: 30000, // INCREASED from 20000 to 30000
+    scheduling: 'fifo',
+    // Enhanced connection management
+    createConnection: (options, callback) => {
+        const socket = http.createConnection(options);
+        socket.setKeepAlive(true, 30000);
+        socket.setTimeout(30000);
+        callback(null, socket);
+    }
 });
 
 const httpsAgent = new https.Agent({
     keepAlive: true,
     keepAliveMsecs: 30000,
-    maxSockets: 200, // INCREASED from 100 to 200 to match maxGlobalConnections  
-    maxFreeSockets: 100, // INCREASED from 50 to 100 for better connection reuse
-    timeout: 20000, // INCREASED from 15000 to 20000
+    maxSockets: 500, // INCREASED from 200 to 500 for better throughput
+    maxFreeSockets: 200, // INCREASED from 100 to 200 for better connection reuse
+    timeout: 30000, // INCREASED from 20000 to 30000
     scheduling: 'fifo',
-    rejectUnauthorized: false // Allow self-signed certificates
+    rejectUnauthorized: false, // Allow self-signed certificates
+    // Enhanced connection management
+    createConnection: (options, callback) => {
+        const socket = https.createConnection(options);
+        socket.setKeepAlive(true, 30000);
+        socket.setTimeout(30000);
+        callback(null, socket);
+    }
 });
 
 // Override default agents globally
@@ -60,30 +73,42 @@ https.globalAgent = httpsAgent;
 // System-level connection manager for EMFILE prevention
 class SystemConnectionManager {
     constructor() {
-        this.maxGlobalConnections = crawlerConfig.maxGlobalConnections || 2000; // INCREASED from 500 to 2000
-        this.maxDomainConnections = crawlerConfig.maxConnectionsPerDomain || 5;  // INCREASED from 2 to 5
+        this.maxGlobalConnections = crawlerConfig.maxGlobalConnections || 5000; // INCREASED from 2000 to 5000
+        this.maxDomainConnections = crawlerConfig.maxConnectionsPerDomain || 10;  // INCREASED from 5 to 10
         this.activeConnections = 0;
         this.connectionsByDomain = new Map();
         this.queuedRequests = [];
-        this.requestTimeout = crawlerConfig.queueTimeoutMs || 30000; // INCREASED from 15000 to 30000
+        this.requestTimeout = crawlerConfig.queueTimeoutMs || 45000; // INCREASED from 30000 to 45000
         this.lastEmfileWarning = 0;
-        this.maxQueueSize = crawlerConfig.maxQueueSize || 5000; // NEW: Configurable queue size
-        this.enableBackpressure = crawlerConfig.enableBackpressure || true; // NEW: Backpressure control
-        this.backpressureThreshold = crawlerConfig.backpressureThreshold || 0.8; // NEW: Backpressure threshold
-        this.adaptiveDelay = crawlerConfig.adaptiveDelay || true; // NEW: Adaptive delay
-        this.maxAdaptiveDelayMs = crawlerConfig.maxAdaptiveDelayMs || 10000; // NEW: Max adaptive delay
+        this.maxQueueSize = crawlerConfig.maxQueueSize || 10000; // INCREASED from 5000 to 10000
+        this.enableBackpressure = crawlerConfig.enableBackpressure || true;
+        this.backpressureThreshold = crawlerConfig.backpressureThreshold || 0.8;
+        this.adaptiveDelay = crawlerConfig.adaptiveDelay || true;
+        this.maxAdaptiveDelayMs = crawlerConfig.maxAdaptiveDelayMs || 15000; // INCREASED from 10000 to 15000
+        
+        // Enhanced connection tracking
+        this.connectionHistory = new Map(); // Track connection usage patterns
+        this.domainStats = new Map(); // Track domain-specific statistics
+        this.lastCleanup = Date.now();
+        this.cleanupInterval = 60000; // Cleanup every minute
+        
+        // Circuit breaker for problematic domains
+        this.domainCircuitBreakers = new Map();
+        this.circuitBreakerThreshold = 10; // Failures before opening circuit
+        this.circuitBreakerTimeout = 300000; // 5 minutes
         
         // Start monitoring
         this.startMonitoring();
         
-        logger.info('SystemConnectionManager initialized with optimized settings', {
+        logger.info('SystemConnectionManager initialized with enhanced settings', {
             service: 'SystemConnectionManager',
             maxGlobalConnections: this.maxGlobalConnections,
             maxDomainConnections: this.maxDomainConnections,
             maxQueueSize: this.maxQueueSize,
             requestTimeout: this.requestTimeout,
             enableBackpressure: this.enableBackpressure,
-            backpressureThreshold: this.backpressureThreshold
+            backpressureThreshold: this.backpressureThreshold,
+            circuitBreakerEnabled: true
         });
     }
 
@@ -244,12 +269,222 @@ class SystemConnectionManager {
     }
 
     canAcquire(domain) {
+        const domainKey = this.extractDomainKey(domain);
+        
+        // Check circuit breaker
+        if (this.isCircuitBreakerOpen(domainKey)) {
+            return false;
+        }
+        
+        // Check global connection limit
         if (this.activeConnections >= this.maxGlobalConnections) {
             return false;
         }
         
-        const domainCount = this.connectionsByDomain.get(domain) || 0;
+        // Check domain-specific limit
+        const domainCount = this.connectionsByDomain.get(domainKey) || 0;
         return domainCount < this.maxDomainConnections;
+    }
+    
+    /**
+     * Enhanced connection acquisition with circuit breaker and adaptive delays
+     */
+    async acquireConnection(domain) {
+        const domainKey = this.extractDomainKey(domain);
+        
+        // Check circuit breaker
+        if (this.isCircuitBreakerOpen(domainKey)) {
+            throw new Error(`Circuit breaker open for domain: ${domainKey}`);
+        }
+        
+        // Check global connection limit
+        if (this.activeConnections >= this.maxGlobalConnections) {
+            // Apply backpressure
+            if (this.enableBackpressure) {
+                const utilization = this.activeConnections / this.maxGlobalConnections;
+                if (utilization >= this.backpressureThreshold) {
+                    const delay = this.calculateAdaptiveDelay(utilization);
+                    logger.warn('Applying backpressure due to high connection utilization', {
+                        utilization: `${(utilization * 100).toFixed(1)}%`,
+                        delay: `${delay}ms`,
+                        activeConnections: this.activeConnections,
+                        maxConnections: this.maxGlobalConnections
+                    });
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+            
+            // Queue the request if still at limit
+            if (this.activeConnections >= this.maxGlobalConnections) {
+                return this.queueRequest(domainKey);
+            }
+        }
+        
+        // Check domain-specific limit
+        const domainConnections = this.connectionsByDomain.get(domainKey) || 0;
+        if (domainConnections >= this.maxDomainConnections) {
+            return this.queueRequest(domainKey);
+        }
+        
+        // Acquire connection
+        this.activeConnections++;
+        this.connectionsByDomain.set(domainKey, domainConnections + 1);
+        
+        // Track connection usage
+        this.trackConnectionUsage(domainKey);
+        
+        logger.debug('Connection acquired', {
+            domain: domainKey,
+            activeConnections: this.activeConnections,
+            domainConnections: domainConnections + 1,
+            globalUtilization: `${(this.activeConnections / this.maxGlobalConnections * 100).toFixed(1)}%`
+        });
+        
+        return true;
+    }
+    
+    /**
+     * Enhanced connection release with cleanup
+     */
+    releaseConnection(domain) {
+        const domainKey = this.extractDomainKey(domain);
+        
+        if (this.activeConnections > 0) {
+            this.activeConnections--;
+        }
+        
+        const domainConnections = this.connectionsByDomain.get(domainKey) || 0;
+        if (domainConnections > 0) {
+            this.connectionsByDomain.set(domainKey, domainConnections - 1);
+        }
+        
+        // Process queued requests
+        this.processQueue();
+        
+        logger.debug('Connection released', {
+            domain: domainKey,
+            activeConnections: this.activeConnections,
+            domainConnections: Math.max(0, domainConnections - 1)
+        });
+    }
+    
+    /**
+     * Calculate adaptive delay based on system load
+     */
+    calculateAdaptiveDelay(utilization) {
+        if (!this.adaptiveDelay) return 0;
+        
+        const baseDelay = 100; // Base delay in ms
+        const maxDelay = this.maxAdaptiveDelayMs;
+        
+        // Exponential increase based on utilization
+        const multiplier = Math.pow(utilization, 2);
+        const delay = Math.min(baseDelay * multiplier, maxDelay);
+        
+        // Add jitter to prevent thundering herd
+        const jitter = Math.random() * delay * 0.1;
+        
+        return Math.floor(delay + jitter);
+    }
+    
+    /**
+     * Track connection usage patterns for optimization
+     */
+    trackConnectionUsage(domainKey) {
+        const now = Date.now();
+        const history = this.connectionHistory.get(domainKey) || [];
+        
+        history.push(now);
+        
+        // Keep only recent history (last hour)
+        const cutoff = now - 3600000; // 1 hour
+        const recentHistory = history.filter(timestamp => timestamp > cutoff);
+        
+        this.connectionHistory.set(domainKey, recentHistory);
+        
+        // Update domain statistics
+        const stats = this.domainStats.get(domainKey) || {
+            totalConnections: 0,
+            averageConnections: 0,
+            peakConnections: 0,
+            lastUpdated: now
+        };
+        
+        stats.totalConnections++;
+        stats.averageConnections = recentHistory.length / 60; // Average per minute
+        stats.peakConnections = Math.max(stats.peakConnections, recentHistory.length);
+        stats.lastUpdated = now;
+        
+        this.domainStats.set(domainKey, stats);
+    }
+    
+    /**
+     * Circuit breaker implementation for problematic domains
+     */
+    isCircuitBreakerOpen(domainKey) {
+        const breaker = this.domainCircuitBreakers.get(domainKey);
+        if (!breaker) return false;
+        
+        const now = Date.now();
+        if (breaker.state === 'OPEN' && now < breaker.nextAttempt) {
+            return true;
+        }
+        
+        if (breaker.state === 'OPEN' && now >= breaker.nextAttempt) {
+            breaker.state = 'HALF_OPEN';
+            breaker.halfOpenRequests = 0;
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Record failure for circuit breaker
+     */
+    recordFailure(domainKey) {
+        const breaker = this.domainCircuitBreakers.get(domainKey) || {
+            failures: 0,
+            state: 'CLOSED',
+            nextAttempt: 0,
+            halfOpenRequests: 0
+        };
+        
+        breaker.failures++;
+        
+        if (breaker.state === 'HALF_OPEN') {
+            breaker.halfOpenRequests++;
+            if (breaker.halfOpenRequests >= 3) {
+                breaker.state = 'OPEN';
+                breaker.nextAttempt = Date.now() + this.circuitBreakerTimeout;
+            }
+        } else if (breaker.failures >= this.circuitBreakerThreshold) {
+            breaker.state = 'OPEN';
+            breaker.nextAttempt = Date.now() + this.circuitBreakerTimeout;
+        }
+        
+        this.domainCircuitBreakers.set(domainKey, breaker);
+        
+        logger.warn('Circuit breaker failure recorded', {
+            domain: domainKey,
+            failures: breaker.failures,
+            state: breaker.state,
+            threshold: this.circuitBreakerThreshold
+        });
+    }
+    
+    /**
+     * Record success for circuit breaker
+     */
+    recordSuccess(domainKey) {
+        const breaker = this.domainCircuitBreakers.get(domainKey);
+        if (breaker && breaker.state === 'HALF_OPEN') {
+            breaker.state = 'CLOSED';
+            breaker.failures = 0;
+            breaker.halfOpenRequests = 0;
+            this.domainCircuitBreakers.set(domainKey, breaker);
+            
+            logger.info('Circuit breaker reset to CLOSED', { domain: domainKey });
+        }
     }
 
     grantConnection(request) {
@@ -312,6 +547,22 @@ class SystemConnectionManager {
             connectionsByDomain: Object.fromEntries(this.connectionsByDomain)
         };
     }
+
+    extractDomainKey(domain) {
+        // If domain is a URL, extract the hostname
+        try {
+            if (typeof domain === 'string') {
+                if (domain.startsWith('http://') || domain.startsWith('https://')) {
+                    return new URL(domain).hostname.toLowerCase();
+                }
+                // Remove port if present
+                return domain.split(':')[0].toLowerCase();
+            }
+            return String(domain).toLowerCase();
+        } catch (e) {
+            return domain;
+        }
+    }
 }
 
 // Global system manager instance
@@ -347,12 +598,9 @@ class CrawlerCore {
         // Enhanced error handling components (references to global instances)
         this.errorHandler = new ErrorHandler(this.options);
         
-        // Initialize site-aware duplicate checker for smart crawling
-        this.siteAwareDuplicateChecker = new SiteAwareDuplicateChecker(con, {
-            maxCacheSize: options.maxCacheSize || 50000,
-            batchSize: options.batchSize || 500,
-            enableContentHashing: options.enableContentHashing !== false
-        });
+        // Initialize unified duplicate checker with site-aware features
+        this.siteAwareDuplicateChecker = duplicateChecker;
+        this.siteAwareDuplicateChecker.setDatabaseConnection(con);
         
         // Initialize ContentIndexer for proper database storage
         this.contentIndexer = new ContentIndexer(con);
@@ -904,7 +1152,15 @@ class CrawlerCore {
             });
             
             // Pass crawl options to respect force crawl settings
-            const newUrls = await this.siteAwareDuplicateChecker.findNewUrls(links, targetSiteId, this.options || {});
+            const crawlOptions = { 
+                forceCrawl: this.options.forceCrawl || false,
+                skipRecentCheck: this.options.skipRecentCheck || false,
+                allowRecrawl: this.options.allowRecrawl || false,
+                maxAge: this.options.maxAge || null,
+                crawlInterval: this.options.crawlInterval || null
+            };
+            
+            const newUrls = await this.siteAwareDuplicateChecker.findNewUrls(links, targetSiteId, crawlOptions);
             
             // Update statistics
             this.smartStats.totalUrlsDiscovered += links.length;
@@ -928,15 +1184,24 @@ class CrawlerCore {
             if (newUrls.length > 0) {
                 // Add URLs directly to queue without parent duplicate checking
                 // since we've already done smart filtering
+                let actuallyAdded = 0;
                 for (const url of newUrls) {
                     if (!this.crawlQueue.has(url) && !this.crawledUrls.has(url)) {
                         this.crawlQueue.add(url);
+                        actuallyAdded++;
+                    } else {
+                        logger.debug('Smart filtering: URL already in queue or crawled', { 
+                            url, 
+                            inQueue: this.crawlQueue.has(url),
+                            inCrawled: this.crawledUrls.has(url)
+                        });
                     }
                 }
                 
                 logger.debug('URLs added directly to queue (smart filtering bypass)', {
                     siteId: targetSiteId,
-                    urlsAdded: newUrls.length,
+                    urlsReturned: newUrls.length,
+                    urlsActuallyAdded: actuallyAdded,
                     queueSize: this.crawlQueue.size
                 });
                 
@@ -968,10 +1233,19 @@ class CrawlerCore {
             return;
         }
         
+        // Define crawl options for use throughout this method
+        const crawlOptions = { 
+            forceCrawl: this.options.forceCrawl || false,
+            skipRecentCheck: this.options.skipRecentCheck || false,
+            allowRecrawl: this.options.allowRecrawl || false,
+            crawlInterval: this.options.crawlInterval || null
+        };
+        
         // First, find which URLs are NEW (not in database) - prioritize these
         let newUrls = [];
         try {
-            newUrls = await duplicateChecker.findNewUrls(links, siteId);
+            // Pass options to support forceCrawl in fallback scenarios
+            newUrls = await duplicateChecker.findNewUrls(links, siteId, crawlOptions);
         } catch (e) {
             logger.warn('New URL check failed, falling back to regular duplicate check', { error: e.message });
             newUrls = []; // Fallback to empty new URLs
@@ -1001,15 +1275,28 @@ class CrawlerCore {
                     continue;
                 }
                 
-                // Skip if already in session crawled URLs
+                // Skip if already in session crawled URLs (unless forceCrawl is enabled for re-crawling)
                 if (this.crawledUrls.has(linkUrl)) {
+                    const isForceCrawl = crawlOptions.forceCrawl || crawlOptions.skipRecentCheck || crawlOptions.allowRecrawl;
+                    if (!isForceCrawl) {
                     duplicateCount++;
+                        logger.debug('Skipping URL (already crawled in session)', { url: linkUrl, forceCrawl: isForceCrawl });
                     continue;
+                    } else {
+                        // For force crawl, remove from crawled URLs to allow re-crawling
+                        this.crawledUrls.delete(linkUrl);
+                        logger.debug('Force crawl: Removing URL from crawled set for re-crawling', { url: linkUrl });
+                    }
                 }
                 
-                // Skip if already in queue
+                // Skip if already in queue (unless it's the same crawl session and we need to re-process)
                 if (this.crawlQueue.has(linkUrl)) {
+                    // Don't add duplicates to queue, but don't count as duplicate skip for force crawl
+                    const isForceCrawl = crawlOptions.forceCrawl || crawlOptions.skipRecentCheck || crawlOptions.allowRecrawl;
+                    if (!isForceCrawl) {
                     duplicateCount++;
+                        logger.debug('Skipping URL (already in queue)', { url: linkUrl, forceCrawl: isForceCrawl });
+                    }
                     continue;
                 }
                 
@@ -1019,11 +1306,15 @@ class CrawlerCore {
                     continue;
                 }
                 
-                // Skip if already crawled in DB
+                // Skip if already crawled in DB (unless forceCrawl is enabled)
                 const urlHash = duplicateChecker.hashUrl(duplicateChecker.normalizeUrls ? duplicateChecker.normalizeUrl(linkUrl) : linkUrl);
-                if (alreadyCrawledHashes.has(urlHash)) {
+                const isForceCrawl = crawlOptions.forceCrawl || crawlOptions.skipRecentCheck || crawlOptions.allowRecrawl;
+                if (alreadyCrawledHashes.has(urlHash) && !isForceCrawl) {
                     duplicateCount++;
+                    logger.debug('Skipping URL (already in DB)', { url: linkUrl, forceCrawl: isForceCrawl });
                     continue;
+                } else if (alreadyCrawledHashes.has(urlHash) && isForceCrawl) {
+                    logger.debug('Force crawl: Adding URL despite being in DB', { url: linkUrl, forceCrawl: isForceCrawl });
                 }
                 
                 // Add to queue
@@ -1079,55 +1370,44 @@ class CrawlerCore {
      */
     async processQueue(maxPages = 250, maxDepth = 3) {
         try {
-            // Check existing URLs in database before starting
+            // Check existing URLs in database for informational purposes only
         let existingUrlCount = 0;
-        let remainingPagesToCrawl = maxPages;
+        let newUrlsToCrawl = maxPages; // Always crawl for new URLs regardless of existing count
         
             const siteId = this.smartStats.siteId || this.db_row?.site_id;
             
             if (siteId) {
             try {
                     existingUrlCount = await this.getExistingUrlCount(siteId);
-                remainingPagesToCrawl = Math.max(0, maxPages - existingUrlCount);
                 
                     logger.info('Smart crawler pre-crawl database check', {
                         siteId: siteId,
                     existingUrlsInDb: existingUrlCount,
                     maxPagesLimit: maxPages,
-                    remainingPagesToCrawl: remainingPagesToCrawl,
-                    efficiency: `${((existingUrlCount / (existingUrlCount + remainingPagesToCrawl)) * 100).toFixed(1)}% existing`
+                    newUrlsTargetThisCrawl: newUrlsToCrawl,
+                    efficiency: `Will add up to ${newUrlsToCrawl} new URLs to existing ${existingUrlCount} URLs`
                 });
                 
-                // If we already have enough URLs in database, skip crawling (unless forceCrawl is enabled)
-                if (remainingPagesToCrawl <= 0 && !this.options.forceCrawl) {
-                        logger.info('Smart crawler: Site already has sufficient URLs in database, skipping crawl', {
+                // CHANGED: Always crawl for new URLs, regardless of existing count
+                // This allows continuous growth of the database
+                logger.info('Smart crawler: Always crawling for new URLs to grow database continuously', {
                             siteId: siteId,
                         existingUrls: existingUrlCount,
-                        maxPages: maxPages
-                    });
-                        return [];
-                } else if (remainingPagesToCrawl <= 0 && this.options.forceCrawl) {
-                        // Ensure we still have a positive budget to process
-                        remainingPagesToCrawl = maxPages; // use full budget when forcing crawl
-                        logger.info('Smart crawler: Force crawl enabled, proceeding despite sufficient URLs in database', {
-                            siteId: siteId,
-                        existingUrls: existingUrlCount,
-                        maxPages: maxPages,
-                        assignedBudget: remainingPagesToCrawl
-                    });
-                }
+                    targetNewUrls: newUrlsToCrawl,
+                    projectedTotal: existingUrlCount + newUrlsToCrawl
+                });
+                
             } catch (error) {
                     logger.warn('Smart crawler: Failed to check existing URLs, proceeding with full crawl', {
                         siteId: siteId,
                     error: error.message
                 });
-                remainingPagesToCrawl = maxPages;
             }
         }
         
             logger.info('Starting smart queue processing with database optimization', {
                 siteId: siteId,
-            maxPages: remainingPagesToCrawl,
+            maxPages: newUrlsToCrawl,
             maxDepth,
                 queueSize: this.crawlQueue.size,
             existingUrlsInDb: existingUrlCount
@@ -1139,7 +1419,7 @@ class CrawlerCore {
             let uniquePagesCrawled = 0;
             let httpRequestsMade = 0;
         
-        while (this.hasMoreUrls() && uniquePagesCrawled < remainingPagesToCrawl && currentDepth < maxDepth) {
+        while (this.hasMoreUrls() && uniquePagesCrawled < newUrlsToCrawl && currentDepth < maxDepth) {
             const batchSize = Math.min(10, this.crawlQueue.size);
             const currentBatch = [];
             
@@ -1209,7 +1489,7 @@ class CrawlerCore {
             });
             
             // Add delay between batches to be respectful
-            if (this.hasMoreUrls() && uniquePagesCrawled < remainingPagesToCrawl) {
+            if (this.hasMoreUrls() && uniquePagesCrawled < newUrlsToCrawl) {
                 await this.delay(1000); // 1 second between batches
             }
             
@@ -1222,7 +1502,7 @@ class CrawlerCore {
                 uniquePagesCrawled,
                 duplicatesSkipped,
                 httpRequestsMade,
-                efficiency: `${((uniquePagesCrawled / (uniquePagesCrawled + duplicatesSkipped)) * 100).toFixed(1)}%`
+                efficiency: `${((uniquePagesCrawled + duplicatesSkipped) > 0 ? (uniquePagesCrawled / (uniquePagesCrawled + duplicatesSkipped)) * 100 : 0).toFixed(1)}%`
             });
         }
             
@@ -1247,7 +1527,7 @@ class CrawlerCore {
             finalQueueSize: this.crawlQueue.size,
             existingUrlsInDb: existingUrlCount,
             totalUrlsForSite: totalUrlsForSite,
-            efficiency: `${((uniquePagesCrawled / (uniquePagesCrawled + duplicatesSkipped)) * 100).toFixed(1)}%`,
+            efficiency: `${((uniquePagesCrawled + duplicatesSkipped) > 0 ? (uniquePagesCrawled / (uniquePagesCrawled + duplicatesSkipped)) * 100 : 0).toFixed(1)}%`,
             resourceSavings: `Saved ${duplicatesSkipped} unnecessary HTTP requests`,
             databaseOptimization: `Found ${existingUrlCount} existing URLs, crawled ${uniquePagesCrawled} new URLs (Total: ${totalUrlsForSite})`
         });
