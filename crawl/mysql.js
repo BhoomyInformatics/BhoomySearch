@@ -9,7 +9,7 @@ class Database {
             host: process.env.DB_HOST || "localhost",
             user: process.env.DB_USER || "mybhoomy_admin",
             password: process.env.DB_PASSWORD || "mhQjj.%C-_LO_U4",
-            database: process.env.DB_NAME || "mybhoomy_mytest",
+            database: process.env.DB_NAME || "mybhoomy_mysearch",
             connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT) || 200,
             idleTimeout: 600000,
             enableKeepAlive: true,

@@ -1,0 +1,137 @@
+# ============================================================================
+# MySQL Configuration for High-Concurrency Crawler (80GB Database)
+# ============================================================================
+# Add these settings to your MySQL configuration file:
+# - Windows: C:\ProgramData\MySQL\MySQL Server 8.0\my.ini
+# - Linux: /etc/mysql/my.cnf or /etc/my.cnf
+# ============================================================================
+
+[mysqld]
+
+# ============================================================================
+# InnoDB Settings for Deadlock Prevention
+# ============================================================================
+
+# Increase lock wait timeout (default: 50 seconds)
+# This gives transactions more time before timing out
+innodb_lock_wait_timeout = 120
+
+# Increase rollback segments for better concurrency
+innodb_rollback_segments = 128
+
+# Increase buffer pool for your 80GB database
+# Set to 50-70% of available RAM (adjust based on your server)
+# For 128GB RAM, use 80-90GB
+innodb_buffer_pool_size = 80G
+
+# Split buffer pool into instances for better concurrency
+# Recommended: 1 instance per GB up to 64 instances
+innodb_buffer_pool_instances = 64
+
+# Increase log file size for fewer checkpoints
+innodb_log_file_size = 2G
+innodb_log_buffer_size = 256M
+
+# Flush method for better performance
+innodb_flush_method = O_DIRECT
+
+# Increase thread concurrency
+innodb_thread_concurrency = 0
+
+# Adaptive hash index for faster lookups
+innodb_adaptive_hash_index = ON
+
+# ============================================================================
+# Connection Settings
+# ============================================================================
+
+# Increase max connections
+max_connections = 500
+
+# Increase table open cache
+table_open_cache = 4000
+table_definition_cache = 2000
+
+# ============================================================================
+# Query Cache (Disable for high-write workload)
+# ============================================================================
+
+# Query cache is deprecated in MySQL 8.0+
+# If using older MySQL:
+# query_cache_type = 0
+# query_cache_size = 0
+
+# ============================================================================
+# Deadlock Detection
+# ============================================================================
+
+# Enable deadlock detection (default: ON)
+innodb_deadlock_detect = ON
+
+# Print all deadlocks to error log
+innodb_print_all_deadlocks = ON
+
+# ============================================================================
+# Transaction Isolation Level
+# ============================================================================
+
+# Use READ COMMITTED for better concurrency (less locking)
+# Default is REPEATABLE READ which can cause more deadlocks
+transaction_isolation = READ-COMMITTED
+
+# ============================================================================
+# I/O Performance
+# ============================================================================
+
+# Increase I/O capacity for faster writes
+innodb_io_capacity = 2000
+innodb_io_capacity_max = 4000
+
+# Increase write I/O threads
+innodb_write_io_threads = 16
+innodb_read_io_threads = 16
+
+# ============================================================================
+# Monitoring and Logging
+# ============================================================================
+
+# Slow query log for performance monitoring
+slow_query_log = 1
+slow_query_log_file = /var/log/mysql/mysql-slow.log
+long_query_time = 2
+
+# Log queries not using indexes
+log_queries_not_using_indexes = 1
+
+# ============================================================================
+# Additional Performance Tuning
+# ============================================================================
+
+# Increase sort buffer for large sorts
+sort_buffer_size = 4M
+read_buffer_size = 2M
+read_rnd_buffer_size = 8M
+
+# Increase join buffer
+join_buffer_size = 4M
+
+# Increase temp table size
+tmp_table_size = 256M
+max_heap_table_size = 256M
+
+# ============================================================================
+# NOTES
+# ============================================================================
+# 1. After adding these settings, restart MySQL:
+#    - Windows: Restart MySQL service
+#    - Linux: sudo systemctl restart mysql
+#
+# 2. Monitor performance with:
+#    SHOW ENGINE INNODB STATUS;
+#    SHOW PROCESSLIST;
+#
+# 3. Check for deadlocks in error log:
+#    - Windows: C:\ProgramData\MySQL\MySQL Server 8.0\Data\*.err
+#    - Linux: /var/log/mysql/error.log
+# ============================================================================
+

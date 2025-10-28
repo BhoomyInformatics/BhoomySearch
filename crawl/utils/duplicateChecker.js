@@ -533,7 +533,7 @@ class DuplicateChecker {
             const statsQuery = `
                 SELECT 
                     COUNT(*) AS total_crawled_urls,
-                    MAX(crawl_date) AS last_crawl_date
+                       MAX(crawl_date) AS last_crawl_date
                 FROM site_data
                 WHERE site_data_site_id = ?
             `;
@@ -665,19 +665,19 @@ class DuplicateChecker {
                         }
                     }
                 });
-                
+            
                 logger.info('Loaded site URLs into cache', {
-                    siteId,
+                siteId,
                     urlsLoaded: urlResults.length,
-                    cacheSize: siteCache.urlHashes.size
-                });
+                cacheSize: siteCache.urlHashes.size
+            });
             } else {
                 logger.info('No cached URLs loaded for site', {
                     siteId,
                     message: 'This is OK for new sites or when table is empty'
                 });
             }
-        } catch (error) {
+            } catch (error) {
             logger.warn('Error loading site crawled URLs, continuing without cache', { 
                 siteId, 
                 error: error.message,

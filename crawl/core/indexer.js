@@ -408,9 +408,10 @@ class ContentIndexer {
                 contentLength: values[11] ? values[11].length : 0
             });
 
-            // Insert into site_data table with improved error handling and pre-calculated metrics
+            // Insert into site_data table with improved error handling, deadlock retry, and pre-calculated metrics
+            // CRITICAL FIX: Use INSERT IGNORE to prevent deadlocks from concurrent duplicate inserts
             const insertQuery = `
-                INSERT INTO site_data (
+                INSERT IGNORE INTO site_data (
                     site_data_site_id, site_data_link, site_data_title, site_data_description,
                     site_data_keywords, site_data_author, site_data_generator,
                     site_data_h1, site_data_h2, site_data_h3, site_data_h4,
@@ -420,41 +421,116 @@ class ContentIndexer {
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `;
 
+            // Retry logic for deadlocks and lock wait timeouts
             let result;
-            try {
-                // Use direct query for data insertion
-                result = await this.dbConnection.query(insertQuery, values);
-            } catch (insertError) {
-                // Handle duplicate key errors gracefully
-                if (insertError.code === 'ER_DUP_ENTRY') {
-                    logger.warn('Duplicate entry detected during insertion', { 
-                        url: decodedUrl, 
-                        error: insertError.message 
-                    });
-                    
-                    // Try to get the existing record ID
-                    try {
-                        const existingRecord = await this.dbConnection.query(
-                            'SELECT site_data_id FROM site_data WHERE site_data_url_hash = ? LIMIT 1',
-                            [urlHash]
-                        );
+            let retries = 0;
+            const maxRetries = 3;
+            const baseDelay = 100; // Start with 100ms
+
+            while (retries <= maxRetries) {
+                try {
+                    // Use direct query for data insertion
+                    result = await this.dbConnection.query(insertQuery, values);
+                    break; // Success - exit retry loop
+                } catch (insertError) {
+                    // Handle deadlock and lock wait timeout errors with retry
+                    if ((insertError.code === 'ER_LOCK_DEADLOCK' || 
+                         insertError.code === 'ER_LOCK_WAIT_TIMEOUT') && 
+                        retries < maxRetries) {
                         
-                        if (existingRecord && existingRecord.length > 0) {
-                            return {
-                                insertId: existingRecord[0].site_data_id,
-                                isDuplicate: true,
-                                message: 'Duplicate entry detected during insertion'
-                            };
-                        }
-                    } catch (selectError) {
-                        logger.error('Failed to retrieve existing duplicate record', { 
+                        retries++;
+                        const delay = baseDelay * Math.pow(2, retries - 1); // Exponential backoff
+                        
+                        logger.warn('Database lock error, retrying...', { 
+                            url: decodedUrl,
+                            errorCode: insertError.code,
+                            attempt: retries,
+                            maxRetries,
+                            retryDelay: delay,
+                            error: insertError.message
+                        });
+                        
+                        // Wait before retrying
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        continue; // Retry the operation
+                    }
+                    
+                    // Handle duplicate key errors gracefully
+                    if (insertError.code === 'ER_DUP_ENTRY') {
+                        logger.info('Duplicate entry detected (concurrent insert by another crawler)', { 
                             url: decodedUrl, 
-                            error: selectError.message 
+                            error: insertError.message 
+                        });
+                        
+                        // Try to get the existing record ID
+                        try {
+                            const existingRecord = await this.dbConnection.query(
+                                'SELECT site_data_id FROM site_data WHERE site_data_url_hash = ? AND site_data_site_id = ? LIMIT 1',
+                                [urlHash, safeSiteId]
+                            );
+                            
+                            if (existingRecord && existingRecord.length > 0) {
+                                return {
+                                    insertId: existingRecord[0].site_data_id,
+                                    isDuplicate: true,
+                                    message: 'Duplicate entry - URL already indexed by another crawler instance'
+                                };
+                            }
+                        } catch (selectError) {
+                            logger.error('Failed to retrieve existing duplicate record', { 
+                                url: decodedUrl, 
+                                error: selectError.message 
+                            });
+                        }
+                    }
+                    
+                    // Log final error after all retries exhausted
+                    if (retries >= maxRetries && (insertError.code === 'ER_LOCK_DEADLOCK' || insertError.code === 'ER_LOCK_WAIT_TIMEOUT')) {
+                        logger.error('Database lock error - max retries exceeded', {
+                            url: decodedUrl,
+                            errorCode: insertError.code,
+                            attempts: retries + 1,
+                            error: insertError.message
                         });
                     }
+                    
+                    throw insertError; // Re-throw if not recoverable
+                }
+            }
+
+            // Check if INSERT IGNORE skipped the insert (affectedRows = 0)
+            if (result && result.affectedRows === 0) {
+                logger.info('URL already exists (INSERT IGNORE skipped)', { 
+                    url: decodedUrl, 
+                    siteId: safeSiteId
+                });
+                
+                // Try to get the existing record ID
+                try {
+                    const existingRecord = await this.dbConnection.query(
+                        'SELECT site_data_id FROM site_data WHERE site_data_url_hash = ? AND site_data_site_id = ? LIMIT 1',
+                        [urlHash, safeSiteId]
+                    );
+                    
+                    if (existingRecord && existingRecord.length > 0) {
+                        return {
+                            insertId: existingRecord[0].site_data_id,
+                            isDuplicate: true,
+                            message: 'URL already exists in database'
+                        };
+                    }
+                } catch (selectError) {
+                    logger.warn('Could not retrieve existing record ID', { 
+                        url: decodedUrl, 
+                        error: selectError.message 
+                    });
                 }
                 
-                throw insertError; // Re-throw if not a duplicate error
+                return {
+                    insertId: null,
+                    isDuplicate: true,
+                    message: 'URL already exists (INSERT IGNORE)'
+                };
             }
 
             const insertId = result.insertId;
