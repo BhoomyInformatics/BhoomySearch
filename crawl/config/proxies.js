@@ -1,51 +1,58 @@
-// TOR SOCKS5 proxy configuration
-const TOR_PROXY = "socks5h://127.0.0.1:9050";
+require('dotenv').config();
+const { HttpsProxyAgent } = require('https-proxy-agent');
+const { ProxyAgent } = require('proxy-agent');
 
-// Backup proxy list for fallback
-const BACKUP_PROXIES = [
-    "socks5://127.0.0.1:1080",   // Dante SOCKS5
-    "http://localhost:3128",      // Squid HTTP
-    "http://localhost:8080",      // Alternative HTTP
-    "socks5://localhost:1080",    // Alternative SOCKS5
-    "http://127.0.0.1:3128",     // Local Squid
-    "socks5://127.0.0.1:9050"    // Local TOR (fallback)
-];
-
-// Proxy configuration options
-const proxyConfig = {
-    // TOR specific settings
-    tor: {
-        url: TOR_PROXY,
-        timeout: 30000,
-        retries: 2,
-        retryDelay: 5000
-    },
-    
-    // Backup proxy settings
-    backup: {
-        urls: BACKUP_PROXIES,
-        timeout: 20000,
-        retries: 1,
-        retryDelay: 3000
-    },
-    
-    // Direct connection settings
-    direct: {
-        timeout: 15000,
-        retries: 0
-    },
-    
-    // Common settings for all proxies
-    common: {
-        strictSSL: false,
-        rejectUnauthorized: false,
-        tunnel: false
+class ProxyManager {
+    constructor() {
+        this.proxyUrl = process.env.CRAWLER_PROXY_URL || 'http://localhost:3128';
+        this.enabled = process.env.CRAWLER_ENABLE_PROXY === 'true';
     }
-};
 
-// Export proxy configurations
-module.exports = {
-    TOR_PROXY,
-    BACKUP_PROXIES,
-    proxyConfig
-};
+    getAgent() {
+        if (!this.enabled) {
+            return null;
+        }
+
+        try {
+            return new HttpsProxyAgent(this.proxyUrl);
+        } catch (error) {
+            console.warn('Failed to create HttpsProxyAgent, using ProxyAgent:', error.message);
+            return new ProxyAgent(this.proxyUrl);
+        }
+    }
+
+    getProxyOptions() {
+        if (!this.enabled) {
+            return {
+                proxy: null,
+                tunnel: false,
+                agent: null
+            };
+        }
+
+        return {
+            proxy: this.proxyUrl,
+            tunnel: false,
+            agent: this.getAgent()
+        };
+    }
+
+    shouldRetryWithoutProxy(error) {
+        const proxyErrors = [
+            'tunneling socket could not be established',
+            'ECONNRESET',
+            'ETIMEDOUT',
+            'ECONNREFUSED',
+            'dh key too small',
+            'SSL handshake',
+            'ERROR: The requested URL could not be retrieved',
+            'Protocol error (TLS code: SQUID_ERR_SSL_HANDSHAKE)'
+        ];
+
+        return proxyErrors.some(errMsg => 
+            error.message && error.message.includes(errMsg)
+        );
+    }
+}
+
+module.exports = new ProxyManager();

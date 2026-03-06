@@ -1,0 +1,43 @@
+# =====================================================
+# SearchEngine Bhoomy Crawler - Production Environment Configuration
+# =====================================================
+
+# =========================================================
+# DATABASE CONFIGURATION
+# =========================================Test============
+DB_HOST=localhost
+DB_USER=mybhoomy_data
+DB_PASSWORD=ookfF^6CWf^!dH0
+DB_NAME=mybhoomy_sitedata
+DB_CONNECTION_LIMIT=50
+
+# =========================================Production======
+#DB_HOST=localhost
+#DB_USER=mybhoomy_admin
+#DB_PASSWORD=mhQjj.%C-_LO_U4
+#DB_NAME=mybhoomy_mysearch
+#DB_CONNECTION_LIMIT=50
+
+# =====================================================
+
+# =====================================================
+# ELASTIC SEARCH CONFIGURATION
+# =====================================================
+DB_HOST=localhost
+DB_PORT=3306
+ELASTICSEARCH_INDEX=bhoomy_search
+ELASTICSEARCH_USERNAME=elastic
+ELASTICSEARCH_PASSWORD=MtuWUQonC5bUkcGyfPwh
+DB_CONNECTION_LIMIT=200
+DB_ACQUIRE_TIMEOUT=60000
+DB_TIMEOUT=60000
+
+# =====================================================
+# PROXY CONFIGURATION
+# =====================================================
+HTTP_PROXY=http://localhost:3128
+HTTPS_PROXY=http://localhost:3128
+NO_PROXY=localhost,127.0.0.1
+
+
+# =====================================================

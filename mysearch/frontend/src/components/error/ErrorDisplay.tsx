@@ -97,7 +97,10 @@ const ErrorDisplay: React.FC<ErrorDisplayProps> = ({
       id: error.id,
       type: error.type,
       message: error.message,
-      timestamp: new Date(error.timestamp).toISOString(),
+      timestamp: error.timestamp ? (() => {
+        const date = new Date(error.timestamp);
+        return isNaN(date.getTime()) ? error.timestamp : date.toISOString();
+      })() : new Date().toISOString(),
       statusCode: error.statusCode,
       context: error.context
     };
@@ -189,7 +192,10 @@ const ErrorDisplay: React.FC<ErrorDisplayProps> = ({
             
             <span className="font-medium text-gray-700 dark:text-gray-300">Time:</span>
             <span className="text-gray-600 dark:text-gray-400">
-              {new Date(error.timestamp).toLocaleString()}
+              {error.timestamp ? (() => {
+                const date = new Date(error.timestamp);
+                return isNaN(date.getTime()) ? 'N/A' : date.toLocaleString();
+              })() : 'N/A'}
             </span>
           </div>
           

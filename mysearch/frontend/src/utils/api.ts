@@ -1,5 +1,7 @@
 import axios, { AxiosInstance, AxiosResponse } from 'axios';
 import { SearchQuery, SearchResponse, ApiResponse, Site, CrawlStatistics } from '../types';
+// MOCK API DISABLED - Using production server with direct DB and Elasticsearch access
+// import { mockSearchAPI, mockImagesAPI, mockNewsAPI, mockVideosAPI } from './mockApi';
 
 class APIClient {
   private api: AxiosInstance;
@@ -81,7 +83,11 @@ class APIClient {
   }
 
   private handleError(error: any): ApiResponse {
-    console.error('API Error:', error);
+    const isConnectionError = error.code === 'ECONNREFUSED' || 
+                              error.code === 'ERR_CONNECTION_REFUSED' || 
+                              error.code === 'ENOTFOUND' ||
+                              error.message?.includes('Network Error') ||
+                              error.message?.includes('ERR_CONNECTION_REFUSED');
     
     if (error.response) {
       // Server responded with an error status
@@ -95,15 +101,17 @@ class APIClient {
         error: errorMessage,
         code: statusCode
       };
-    } else if (error.request || error.code === 'ECONNREFUSED' || error.code === 'ERR_CONNECTION_REFUSED' || error.code === 'ENOTFOUND') {
-      // Network error - backend is not available
-      console.warn('Backend server not available, using fallback data');
+    } else if (error.request || isConnectionError) {
+      // Network error - backend is not available (don't log error, just return)
+      // The caller will handle fallback to mock API
       return {
         success: false,
-        error: 'Backend server not available - using demo data',
+        error: 'Backend server not available',
         code: 0
       };
     } else {
+      // Only log unexpected errors
+      console.error('API Error:', error);
       return {
         success: false,
         error: error.message || 'An unexpected error occurred',
@@ -172,9 +180,35 @@ class APIClient {
       });
       
       return handledResponse;
-    } catch (error) {
+    } catch (error: any) {
+      const errorResponse = this.handleError(error);
+      
+      // MOCK API DISABLED - Using production server with direct DB and Elasticsearch access
+      // Fallback to mock API if backend is unavailable - DISABLED
+      /*
+      const isConnectionError = error.code === 'ECONNREFUSED' || 
+                                error.code === 'ERR_CONNECTION_REFUSED' || 
+                                error.code === 'ENOTFOUND' ||
+                                errorResponse.code === 0;
+      
+      if (!errorResponse.success && isConnectionError) {
+        // Only log fallback message, don't log the connection error (expected when backend is down)
+        console.log('🔄 Falling back to mock API for search');
+        try {
+          return await mockSearchAPI(query.q, query.page || 1);
+        } catch (mockError) {
+          console.error('❌ Mock API also failed:', mockError);
+          return errorResponse;
+        }
+      } else if (!isConnectionError) {
+        // Only log non-connection errors
+        console.error('❌ API search failed:', error);
+      }
+      */
+      
+      // Log all errors when mock API is disabled
       console.error('❌ API search failed:', error);
-      return this.handleError(error);
+      return errorResponse;
     }
   }
 
@@ -187,9 +221,25 @@ class APIClient {
       });
       console.log('✅ API images search successful');
       return this.handleResponse<any>(response);
-    } catch (error) {
+    } catch (error: any) {
       console.error('❌ API images search failed:', error);
-      return this.handleError(error);
+      const errorResponse = this.handleError(error);
+      
+      // MOCK API DISABLED - Using production server with direct DB and Elasticsearch access
+      // Fallback to mock API if backend is unavailable - DISABLED
+      /*
+      if (!errorResponse.success && (errorResponse.code === 0 || error.code === 'ECONNREFUSED' || error.code === 'ERR_CONNECTION_REFUSED' || error.code === 'ENOTFOUND')) {
+        console.log('🔄 Falling back to mock API for images');
+        try {
+          return await mockImagesAPI(query, page);
+        } catch (mockError) {
+          console.error('❌ Mock API also failed:', mockError);
+          return errorResponse;
+        }
+      }
+      */
+      
+      return errorResponse;
     }
   }
 
@@ -202,9 +252,25 @@ class APIClient {
       });
       console.log('✅ API news search successful');
       return this.handleResponse<any>(response);
-    } catch (error) {
+    } catch (error: any) {
       console.error('❌ API news search failed:', error);
-      return this.handleError(error);
+      const errorResponse = this.handleError(error);
+      
+      // MOCK API DISABLED - Using production server with direct DB and Elasticsearch access
+      // Fallback to mock API if backend is unavailable - DISABLED
+      /*
+      if (!errorResponse.success && (errorResponse.code === 0 || error.code === 'ECONNREFUSED' || error.code === 'ERR_CONNECTION_REFUSED' || error.code === 'ENOTFOUND')) {
+        console.log('🔄 Falling back to mock API for news');
+        try {
+          return await mockNewsAPI(query, page);
+        } catch (mockError) {
+          console.error('❌ Mock API also failed:', mockError);
+          return errorResponse;
+        }
+      }
+      */
+      
+      return errorResponse;
     }
   }
 
@@ -217,9 +283,25 @@ class APIClient {
       });
       console.log('✅ API videos search successful');
       return this.handleResponse<any>(response);
-    } catch (error) {
+    } catch (error: any) {
       console.error('❌ API videos search failed:', error);
-      return this.handleError(error);
+      const errorResponse = this.handleError(error);
+      
+      // MOCK API DISABLED - Using production server with direct DB and Elasticsearch access
+      // Fallback to mock API if backend is unavailable - DISABLED
+      /*
+      if (!errorResponse.success && (errorResponse.code === 0 || error.code === 'ECONNREFUSED' || error.code === 'ERR_CONNECTION_REFUSED' || error.code === 'ENOTFOUND')) {
+        console.log('🔄 Falling back to mock API for videos');
+        try {
+          return await mockVideosAPI(query, page);
+        } catch (mockError) {
+          console.error('❌ Mock API also failed:', mockError);
+          return errorResponse;
+        }
+      }
+      */
+      
+      return errorResponse;
     }
   }
 
@@ -229,8 +311,18 @@ class APIClient {
         params: { q: query }
       });
       return this.handleResponse<string[]>(response);
-    } catch (error) {
-      console.error('❌ API suggestions failed:', error);
+    } catch (error: any) {
+      // Only log error if it's not a connection refused (backend down is expected in dev)
+      const isConnectionError = error.code === 'ECONNREFUSED' || 
+                                error.code === 'ERR_CONNECTION_REFUSED' || 
+                                error.code === 'ENOTFOUND' ||
+                                error.message?.includes('Network Error') ||
+                                error.message?.includes('ERR_CONNECTION_REFUSED');
+      
+      if (!isConnectionError) {
+        console.error('❌ API suggestions failed:', error);
+      }
+      
       return {
         success: false,
         error: 'Suggestions service temporarily unavailable',

@@ -1138,12 +1138,14 @@ const get_news = async (searchParams = {}) => {
                 'site_data_title', 
                 'site_data_description',
                 'site_data_link',
+                'site_data_image',       // Include image field for news articles
                 'site_data_icon',        // Only field that actually exists
                 'site_data_last_update',
                 'site_data_date',
                 'site_data_author',
                 'site_title',
-                'site_category'
+                'site_category',
+                'site_data_source'       // Include source field if available
             ], // Only fetch fields that actually exist
             track_total_hits: true,
             preference: '_local',

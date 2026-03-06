@@ -3,9 +3,9 @@ import React from 'react';
 const Footer: React.FC = () => {
   return (
     <footer className="footer-container" style={{
-      backgroundColor: '#f8f9fa',
+      backgroundColor: '#fce7f3',
       borderTop: '1px solid #e5e5e5',
-      padding: '20px 0',
+      padding: '10px 0',
       marginTop: 'auto'
     }}>
       <div className="footer-row" style={{
@@ -16,63 +16,60 @@ const Footer: React.FC = () => {
         margin: '0 auto',
         padding: '0 20px',
         flexWrap: 'wrap',
-        gap: '20px'
+        gap: '10px'
       }}>
         <div className="footer-col">
-          <p style={{ margin: '0', fontSize: '14px', color: '#333' }}>
-            <strong>Copyright © 2025 Bhoomy. All rights reserved.</strong>
+          <p style={{ margin: '0', fontSize: '12px' }}>
+            <strong style={{ color: '#fe780e' }}>
+              Copyright © 2025 Bhoomy. All rights reserved.
+            </strong>
           </p>
         </div>
         
         <div className="footer-col footer-center">
-          <p style={{ margin: '0', fontSize: '14px', color: '#333' }}>
-            <strong>
+          <p style={{ margin: '0', fontSize: '12px' }}>
+            <strong style={{ color: '#fe780e' }}>
               <a 
                 href="https://bhoomy.in/" 
                 className="make-in-india" 
                 style={{ 
-                  color: '#007bff', 
+                  color: '#fe780e', 
                   textDecoration: 'none',
                   marginRight: '10px'
                 }}
                 onMouseOver={(e) => e.currentTarget.style.textDecoration = 'underline'}
                 onMouseOut={(e) => e.currentTarget.style.textDecoration = 'none'}
               >
-                Make In India
+                About Us
               </a>
               |
               <a 
-                href="https://about.bhoomy.in/" 
-                className="about-us" 
+                href="mailto:info@bhoomy.in" 
+                className="feedback" 
                 style={{ 
-                  color: '#007bff', 
+                  color: '#fe780e', 
+                  textDecoration: 'none',
+                  marginLeft: '10px',
+                  marginRight: '10px'
+                }}
+                onMouseOver={(e) => e.currentTarget.style.textDecoration = 'underline'}
+                onMouseOut={(e) => e.currentTarget.style.textDecoration = 'none'}
+              >
+                Feedback:info@bhoomy.in
+              </a>
+              |
+              <a 
+                href="https://bhoomy.in/terms" 
+                className="terms" 
+                style={{ 
+                  color: '#fe780e', 
                   textDecoration: 'none',
                   marginLeft: '10px'
                 }}
                 onMouseOver={(e) => e.currentTarget.style.textDecoration = 'underline'}
                 onMouseOut={(e) => e.currentTarget.style.textDecoration = 'none'}
               >
-                About Us
-              </a>
-            </strong>
-          </p>
-        </div>
-        
-        <div className="footer-col">
-          <p style={{ margin: '0', fontSize: '14px', color: '#333' }}>
-            <strong>
-              Feedback & Suggestion: 
-              <a 
-                href="mailto:info@bhoomy.in" 
-                style={{ 
-                  color: '#007bff', 
-                  textDecoration: 'none',
-                  marginLeft: '5px'
-                }}
-                onMouseOver={(e) => e.currentTarget.style.textDecoration = 'underline'}
-                onMouseOut={(e) => e.currentTarget.style.textDecoration = 'none'}
-              >
-                <b>info@bhoomy.in</b>
+                Terms of use
               </a>
             </strong>
           </p>
@@ -97,4 +94,4 @@ const Footer: React.FC = () => {
   );
 };
 
-export default Footer; 
+export default Footer;

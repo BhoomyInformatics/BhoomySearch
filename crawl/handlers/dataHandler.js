@@ -1,397 +1,209 @@
-const { logger } = require('../utils/logger');
+const crypto = require('crypto');
+const { db } = require('../config/db');
+const UrlValidator = require('../utils/urlValidator');
+const DuplicateChecker = require('../utils/duplicateChecker');
+const logger = require('../utils/logger');
 
-/**
- * Data Handler for Database Column Length Validation
- * 
- * Prevents "Data too long for column" errors by:
- * - Validating field lengths before insertion
- * - Truncating oversized content gracefully
- * - Providing fallback values for required fields
- * - Logging data quality issues
- */
+function computeContentHash(title, article) {
+    const str = [title || '', article || ''].join('\n');
+    return crypto.createHash('sha256').update(str).digest('hex');
+}
+
 class DataHandler {
-    constructor(options = {}) {
-        this.options = {
-            // Column length limits (adjust based on your database schema)
-            columnLimits: {
-                site_data_title: 255,           // VARCHAR(255)
-                site_data_description: 500,     // VARCHAR(500)
-                site_data_keywords: 500,        // VARCHAR(500)
-                site_data_author: 100,          // VARCHAR(100) - this is the problematic one
-                site_data_content: 65535,       // TEXT field (64KB)
-                site_data_url: 2048,            // VARCHAR(2048)
-                site_data_image_url: 2048,      // VARCHAR(2048)
-                site_data_video_url: 2048,      // VARCHAR(2048)
-                site_data_language: 10,         // VARCHAR(10)
-                site_data_category: 100,        // VARCHAR(100)
-                site_data_tags: 1000,           // VARCHAR(1000)
-                ...options.columnLimits
-            },
-            
-            // Truncation behavior
-            truncateMode: options.truncateMode || 'smart', // 'smart', 'simple', 'skip'
-            preserveWords: options.preserveWords !== false,
-            ellipsis: options.ellipsis || '...',
-            
-            // Logging
-            logTruncations: options.logTruncations !== false,
-            logLevel: options.logLevel || 'warn'
-        };
-        
-        this.stats = {
-            totalProcessed: 0,
-            truncated: 0,
-            skipped: 0,
-            errors: 0
-        };
+    constructor(siteId) {
+        this.siteId = siteId;
     }
 
-    /**
-     * Validate and clean data for database insertion
-     */
-    validateAndCleanData(data) {
-        if (!data || typeof data !== 'object') {
-            return {};
-        }
-
-        this.stats.totalProcessed++;
-        const cleanData = {};
-        let hasTruncations = false;
-
-        for (const [column, value] of Object.entries(data)) {
-            try {
-                const limit = this.options.columnLimits[column];
-                
-                if (limit && value !== null && value !== undefined) {
-                    const stringValue = String(value);
-                    
-                    if (stringValue.length > limit) {
-                        cleanData[column] = this.truncateValue(stringValue, limit, column);
-                        hasTruncations = true;
-                        this.stats.truncated++;
-                    } else {
-                        cleanData[column] = stringValue;
-                    }
-                } else {
-                    cleanData[column] = value;
-                }
-            } catch (error) {
-                logger.error('Error processing column data', {
-                    service: 'dataHandler',
-                    column,
-                    error: error.message
-                });
-                
-                cleanData[column] = this.getFallbackValue(column);
-                this.stats.errors++;
-            }
-        }
-
-        if (hasTruncations && this.options.logTruncations) {
-            // Only log truncations occasionally to prevent log spam
-            if (Math.random() < 0.1) { // Log only 10% of truncations
-                logger.warn('Data truncated for database insertion', {
-                    service: 'dataHandler',
-                    url: data.site_data_url || 'unknown',
-                    truncatedFields: Object.keys(data).filter(key => 
-                        data[key] && String(data[key]).length > (this.options.columnLimits[key] || Infinity)
-                    )
-                });
-            }
-        }
-
-        return cleanData;
-    }
-
-    /**
-     * Truncate value based on column limits
-     */
-    truncateValue(value, limit, columnName) {
-        if (!value || limit <= 0) {
-            return '';
-        }
-
-        switch (this.options.truncateMode) {
-            case 'smart':
-                return this.smartTruncate(value, limit, columnName);
-            case 'simple':
-                return this.simpleTruncate(value, limit);
-            case 'skip':
-                this.stats.skipped++;
-                return null; // Skip this field entirely
-            default:
-                return this.simpleTruncate(value, limit);
-        }
-    }
-
-    /**
-     * Smart truncation that preserves words and adds ellipsis
-     */
-    smartTruncate(value, limit, columnName) {
-        const ellipsisLength = this.options.ellipsis.length;
-        const maxContentLength = limit - ellipsisLength;
-
-        if (value.length <= limit) {
-            return value;
-        }
-
-        // For author fields, use simple truncation (names don't need word preservation)
-        if (columnName && columnName.includes('author')) {
-            return value.substring(0, maxContentLength) + this.options.ellipsis;
-        }
-
-        // For other fields, try to preserve words
-        if (this.options.preserveWords && maxContentLength > 10) {
-            const truncated = value.substring(0, maxContentLength);
-            const lastSpaceIndex = truncated.lastIndexOf(' ');
-            
-            if (lastSpaceIndex > maxContentLength * 0.7) {
-                return truncated.substring(0, lastSpaceIndex) + this.options.ellipsis;
-            }
-        }
-
-        return value.substring(0, maxContentLength) + this.options.ellipsis;
-    }
-
-    /**
-     * Simple truncation without word preservation
-     */
-    simpleTruncate(value, limit) {
-        const ellipsisLength = this.options.ellipsis.length;
-        const maxContentLength = limit - ellipsisLength;
-
-        if (value.length <= limit) {
-            return value;
-        }
-
-        return value.substring(0, maxContentLength) + this.options.ellipsis;
-    }
-
-    /**
-     * Get fallback value for a column
-     */
-    getFallbackValue(columnName) {
-        const fallbacks = {
-            site_data_title: 'Untitled',
-            site_data_description: '',
-            site_data_keywords: '',
-            site_data_author: '',
-            site_data_content: '',
-            site_data_url: '',
-            site_data_image_url: '',
-            site_data_video_url: '',
-            site_data_language: 'en',
-            site_data_category: '',
-            site_data_tags: ''
-        };
-
-        return fallbacks[columnName] || '';
-    }
-
-    /**
-     * Validate specific field types
-     */
-    validateField(value, fieldType, maxLength = null) {
-        if (value === null || value === undefined) {
-            return '';
-        }
-
-        const stringValue = String(value).trim();
-
-        switch (fieldType) {
-            case 'url':
-                return this.validateUrl(stringValue, maxLength);
-            case 'author':
-                return this.validateAuthor(stringValue, maxLength);
-            case 'title':
-                return this.validateTitle(stringValue, maxLength);
-            case 'description':
-                return this.validateDescription(stringValue, maxLength);
-            case 'keywords':
-                return this.validateKeywords(stringValue, maxLength);
-            case 'language':
-                return this.validateLanguage(stringValue);
-            default:
-                return maxLength ? this.truncateValue(stringValue, maxLength) : stringValue;
-        }
-    }
-
-    /**
-     * Validate URL field
-     */
-    validateUrl(url, maxLength = 2048) {
-        if (!url) return '';
-        
-        // Basic URL validation
+    async saveOrUpdateSiteData(url, data, linkType = 'internal') {
         try {
-            new URL(url);
-        } catch (error) {
-            logger.debug('Invalid URL provided', { url, error: error.message });
-            return '';
-        }
-
-        return this.truncateValue(url, maxLength, 'url');
-    }
-
-    /**
-     * Validate author field (fixed to preserve Unicode characters like Hindi)
-     */
-    validateAuthor(author, maxLength = 100) {
-        if (!author) return '';
-        
-        // Clean up author field - preserve Unicode characters
-        let cleanAuthor = author
-            .replace(/\s+/g, ' ')           // Replace multiple spaces with single space
-            .replace(/[\r\n\t]+/g, ' ')     // Replace line breaks and tabs with spaces
-            .replace(/[<>]/g, '')           // Remove only dangerous HTML characters
-            .trim();
-
-        // If it's still too long, try to extract just the name part
-        if (cleanAuthor.length > maxLength) {
-            // Try to extract the first meaningful part (often the actual name)
-            const parts = cleanAuthor.split(/[,;|]/).map(part => part.trim());
-            cleanAuthor = parts[0] || cleanAuthor;
-            
-            // If still too long, try to get first few words
-            if (cleanAuthor.length > maxLength) {
-                const words = cleanAuthor.split(' ').slice(0, 3); // First 3 words
-                cleanAuthor = words.join(' ');
+            const normalized = UrlValidator.normalizeUrl(url);
+            if (!normalized || (!normalized.startsWith('http://') && !normalized.startsWith('https://'))) {
+                logger.warn(`Invalid or non-http URL skipped: ${url}`);
+                return null;
             }
+            const urlHash = UrlValidator.generateUrlHash(normalized);
+            const existing = await DuplicateChecker.checkDataDuplicate(this.siteId, normalized);
+
+            if (existing) {
+                return await this.updateSiteData(normalized, data, linkType);
+            } else {
+                return await this.insertSiteData(normalized, data, urlHash, linkType);
+            }
+        } catch (error) {
+            logger.error(`Error saving site data: ${error.message}`);
+            throw error;
         }
-
-        return this.truncateValue(cleanAuthor, maxLength, 'author');
     }
 
-    /**
-     * Validate title field (improved for Unicode support)
-     */
-    validateTitle(title, maxLength = 255) {
-        if (!title) return '';
-        
-        const cleanTitle = title
-            .replace(/\s+/g, ' ')           // Replace multiple spaces with single space
-            .replace(/[\r\n\t]+/g, ' ')     // Replace line breaks and tabs with spaces
-            .replace(/[<>]/g, '')           // Remove only dangerous HTML characters
-            .trim();
+    async insertSiteData(url, data, urlHash, linkType = 'internal') {
+        try {
+            const normalized = UrlValidator.normalizeUrl(url);            
+            const rawTitle = data && data.title ? String(data.title).trim() : '';
+            const titleSource = this.isValidTitleOrDescription(rawTitle) ? rawTitle : '';
+            const rawDescription = data && data.description ? String(data.description).trim() : '';
+            const descriptionSource = this.isValidTitleOrDescription(rawDescription) ? rawDescription : '';
+            await db.query(
+                `INSERT INTO site_data (
+                    site_data_site_id, site_data_link, site_data_title, site_data_description,
+                    site_data_keywords, site_data_author, site_data_generator, site_data_h1,
+                    site_data_h2, site_data_h3, site_data_h4, site_data_article, site_data_icon,
+                    site_data_url_hash, status, crawl_date, link_type, site_data_metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NOW(), ?, ?)`,
+                [
+                    this.siteId, normalized,
+                    this.truncate(titleSource, 500),
+                    this.truncate(descriptionSource, 1048000),
+                    this.truncate(data.keywords, 1048000),
+                    this.truncate(data.author, 255),
+                    this.truncate(data.generator, 255),
+                    this.truncate(data.h1, 1048000),
+                    this.truncate(data.h2, 1048000),
+                    this.truncate(data.h3, 1048000),
+                    this.truncate(data.h4, 1048000),
+                    this.truncate(data.article, 2096000),
+                    this.truncate(data.icon, 2048),
+                    urlHash,
+                    linkType,
+                    data.metadata || null
+                ]
+            );
 
-        return this.truncateValue(cleanTitle, maxLength, 'title');
-    }
+            const result = await db.query(
+                'SELECT * FROM site_data WHERE site_data_site_id = ? AND site_data_url_hash = ?',
+                [this.siteId, urlHash]
+            );
 
-    /**
-     * Validate description field (improved for Unicode support)
-     */
-    validateDescription(description, maxLength = 500) {
-        if (!description) return '';
-        
-        const cleanDescription = description
-            .replace(/\s+/g, ' ')           // Replace multiple spaces with single space
-            .replace(/[\r\n\t]+/g, ' ')     // Replace line breaks and tabs with spaces
-            .replace(/[<>]/g, '')           // Remove only dangerous HTML characters
-            .trim();
-
-        return this.truncateValue(cleanDescription, maxLength, 'description');
-    }
-
-    /**
-     * Validate keywords field
-     */
-    validateKeywords(keywords, maxLength = 500) {
-        if (!keywords) return '';
-        
-        // Handle comma-separated keywords
-        const keywordArray = keywords.split(',').map(k => k.trim()).filter(k => k);
-        let result = keywordArray.join(', ');
-
-        return this.truncateValue(result, maxLength, 'keywords');
-    }
-
-    /**
-     * Validate language field
-     */
-    validateLanguage(language) {
-        if (!language) return 'en';
-        
-        const cleanLang = language.toLowerCase().trim();
-        
-        // Common language codes
-        const validLanguages = ['en', 'es', 'fr', 'de', 'it', 'pt', 'ru', 'zh', 'ja', 'ko', 'ar', 'hi'];
-        
-        if (validLanguages.includes(cleanLang.substring(0, 2))) {
-            return cleanLang.substring(0, 2);
+            logger.info(`Site data inserted: ${url} (link_type: ${linkType})`);
+            return result[0];
+        } catch (error) {
+            if (error.code === 'ER_DUP_ENTRY') {
+                logger.warn(`Duplicate entry detected for ${url}, fetching existing record`);
+                const result = await db.query(
+                    'SELECT * FROM site_data WHERE site_data_site_id = ? AND site_data_url_hash = ?',
+                    [this.siteId, urlHash]
+                );
+                return result[0];
+            }
+            logger.error(`Error inserting site data: ${error.message}`);
+            throw error;
         }
-        
-        return 'en'; // Default fallback
     }
 
-    /**
-     * Process crawler result for database insertion
-     */
-    processForDatabase(crawlerResult, siteData = {}) {
-        if (!crawlerResult) {
-            return this.validateAndCleanData(siteData);
+    async updateSiteData(url, data, linkType = 'internal') {
+        try {
+            const normalized = UrlValidator.normalizeUrl(url);
+            const urlHash = UrlValidator.generateUrlHash(normalized);
+            // Only store actual title/description — never use URL in these columns.
+            const rawTitle = data && data.title ? String(data.title).trim() : '';
+            const titleSource = this.isValidTitleOrDescription(rawTitle) ? rawTitle : '';
+            const rawDescription = data && data.description ? String(data.description).trim() : '';
+            const descriptionSource = this.isValidTitleOrDescription(rawDescription) ? rawDescription : '';
+            const contentHash = computeContentHash(data.title, data.article);
+            await db.query(
+                `UPDATE site_data SET
+                    site_data_title = ?, site_data_description = ?, site_data_keywords = ?,
+                    site_data_author = ?, site_data_generator = ?, site_data_h1 = ?,
+                    site_data_h2 = ?, site_data_h3 = ?, site_data_h4 = ?,
+                    site_data_article = ?, site_data_icon = ?, site_data_last_update = NOW(),
+                    link_type = ?, site_data_metadata = ?, content_hash = ?
+                WHERE site_data_site_id = ? AND site_data_url_hash = ?`,
+                [
+                    this.truncate(titleSource, 500),
+                    this.truncate(descriptionSource, 1048000),
+                    this.truncate(data.keywords, 1048000),
+                    this.truncate(data.author, 255),
+                    this.truncate(data.generator, 255),
+                    this.truncate(data.h1, 1048000),
+                    this.truncate(data.h2, 1048000),
+                    this.truncate(data.h3, 1048000),
+                    this.truncate(data.h4, 1048000),
+                    this.truncate(data.article, 2096000),
+                    this.truncate(data.icon, 2048),
+                    linkType,
+                    data.metadata || null,
+                    contentHash,
+                    this.siteId, urlHash
+                ]
+            );
+
+            const result = await db.query(
+                'SELECT * FROM site_data WHERE site_data_site_id = ? AND site_data_url_hash = ?',
+                [this.siteId, urlHash]
+            );
+
+            logger.info(`Site data updated: ${normalized} (link_type: ${linkType})`);
+            return result[0];
+        } catch (error) {
+            logger.error(`Error updating site data: ${error.message}`);
+            throw error;
         }
+    }
 
-        const processedData = {
-            site_data_title: this.validateField(crawlerResult.title, 'title', 500),
-            site_data_description: this.validateField(crawlerResult.description, 'description', 1000),
-            site_data_keywords: this.validateField(crawlerResult.keywords, 'keywords', 1000),
-            site_data_author: this.validateField(
-                crawlerResult.author || crawlerResult.metadata?.author || '', 
-                'author', 
-                255
-            ),
-            site_data_generator: this.validateField(
-                crawlerResult.generator || crawlerResult.metadata?.generator || '', 
-                'default', 
-                255
-            ),
-            site_data_content: this.validateField(crawlerResult.article || crawlerResult.content, 'content', 16777215),
-            site_data_article: this.validateField(crawlerResult.article || crawlerResult.content, 'content', 16777215),
-            site_data_url: this.validateField(siteData.url || crawlerResult.url, 'url', 2048),
-            site_data_language: this.validateField(crawlerResult.language, 'language'),
-            
-            // Additional fields
-            site_data_image_url: this.validateField(crawlerResult.image_url, 'url', 2048),
-            site_data_video_url: this.validateField(crawlerResult.video_url, 'url', 2048),
-            site_data_category: this.validateField(crawlerResult.category, 'default', 100),
-            site_data_tags: this.validateField(crawlerResult.tags, 'keywords', 1000),
-            
-            // Handle headings
-            site_data_h1: this.validateField(crawlerResult.headings?.h1, 'default', 1000),
-            site_data_h2: this.validateField(crawlerResult.headings?.h2, 'default', 1000),
-            site_data_h3: this.validateField(crawlerResult.headings?.h3, 'default', 1000),
-            site_data_h4: this.validateField(crawlerResult.headings?.h4, 'default', 1000),
-            
-            // Preserve existing site data
-            ...siteData
-        };
+    async updateStatus(url, status) {
+        try {
+            const normalized = UrlValidator.normalizeUrl(url);
+            const urlHash = UrlValidator.generateUrlHash(normalized);
+            await db.query(
+                'UPDATE site_data SET status = ? WHERE site_data_site_id = ? AND site_data_url_hash = ?',
+                [status, this.siteId, urlHash]
+            );
+        } catch (error) {
+            logger.error(`Error updating status: ${error.message}`);
+        }
+    }
 
-        return this.validateAndCleanData(processedData);
+    /**     
+     * Returns Map<urlHash, { status, content_hash }>.
+     */
+    static async getExistingPagesMap(siteId) {
+        const rows = await db.query(
+            'SELECT site_data_url_hash, status, content_hash FROM site_data WHERE site_data_site_id = ?',
+            [siteId]
+        );
+        const map = new Map();
+        for (const r of rows || []) {
+            map.set(r.site_data_url_hash, { status: r.status, content_hash: r.content_hash || null });
+        }
+        return map;
     }
 
     /**
-     * Get handler statistics
+     * Count of crawled (indexed) pages for this site.
      */
-    getStats() {
-        return {
-            ...this.stats,
-            truncationRate: this.stats.totalProcessed > 0 
-                ? (this.stats.truncated / this.stats.totalProcessed * 100).toFixed(2) + '%'
-                : '0%'
-        };
+    static async getCrawledCount(siteId) {
+        const rows = await db.query(
+            'SELECT COUNT(*) AS c FROM site_data WHERE site_data_site_id = ? AND status IN (\'indexed\', \'pending\')',
+            [siteId]
+        );
+        return (rows && rows[0]) ? (rows[0].c || 0) : 0;
     }
 
     /**
-     * Reset statistics
+     * Returns false if the value is a URL/link — title and description must never store URLs.
      */
-    resetStats() {
-        this.stats = {
-            totalProcessed: 0,
-            truncated: 0,
-            skipped: 0,
-            errors: 0
-        };
+    isValidTitleOrDescription(value) {
+        if (!value || typeof value !== 'string') return false;
+        const trimmed = value.trim();
+        if (!trimmed) return false;
+        // Reject strings that look like URLs (http/https or common URL patterns)
+        if (/^https?:\/\//i.test(trimmed)) return false;
+        if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) return false;
+        if (/^www\./i.test(trimmed) && trimmed.includes('.')) return false;
+        return true;
+    }
+
+    truncate(str, len) {
+        if (!str) return '';
+        
+        let strValue = String(str)
+            .replace(/[\u{1F600}-\u{1FAFF}]/gu, '')
+            .replace(/[\u{1F300}-\u{1F5FF}]/gu, '')
+            .replace(/[\u{1F680}-\u{1F6FF}]/gu, '')
+            .replace(/[\u{2600}-\u{27BF}]/gu, '')
+            .replace(/[^\x00-\x7F]/g, '');
+
+        return strValue.length > len ? strValue.slice(0, len) : strValue;
     }
 }
 
-module.exports = { DataHandler }; 
+module.exports = DataHandler;

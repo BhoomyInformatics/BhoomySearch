@@ -1,2480 +1,435 @@
-const Crawler = require('crawler');
-const cheerio = require('cheerio');
-const { JSDOM } = require('jsdom');
-const UserAgent = require('user-agents');
-const RobotsParser = require('robots-parser');
-const axios = require('axios');
+const CrawlerLib = require('crawler');
 const dns = require('dns');
-const zlib = require('zlib');
-const http = require('http');
-const https = require('https');
+const { robotsParser } = require('robots-parser');
+const request = require('request');
 
-const { userAgents } = require('../config/user-agents');
-const { proxyList } = require('../config/proxies');
-const { stealthHeaders } = require('../config/headers');
-const { crawlerConfig } = require('../config/crawlerConfig');
-const systemLimitsManager = require('../config/system-limits');
+const crawlerConfig = require('../config/crawlerConfig');
+const proxyManager = require('../config/proxies');
+const headers = require('../config/headers');
+const { db } = require('../config/db');
+const logger = require('../utils/logger');
+const UrlValidator = require('../utils/urlValidator');
+const ContentTypeHandler = require('../handlers/contentTypeHandler');
+const DataHandler = require('../handlers/dataHandler');
+const Parser = require('../core/parser');
+const Indexer = require('../core/indexer');
+const ImageHandler = require('../handlers/imageHandler');
+const DocumentHandler = require('../handlers/documentHandler');
 
-const { urlValidator } = require('../utils/urlValidator');
-const { duplicateChecker } = require('../utils/duplicateChecker');
-const { resourceMonitor } = require('../utils/resource-monitor');
+require('dotenv').config();
 
-const { HtmlHandler } = require('../handlers/htmlHandler');
-const { DocumentHandler } = require('../handlers/documentHandler');
-const { ImageHandler } = require('../handlers/imageHandler');
-const { DataHandler } = require('../handlers/dataHandler');
-const { ContentTypeHandler } = require('../handlers/contentTypeHandler');
-const { ErrorHandler } = require('../handlers/error-handler');
-const { ContentIndexer } = require('./indexer');
-
-const { logger } = require('../utils/logger');
-
-// Set custom DNS servers for better reliability
-dns.setServers(['8.8.8.8', '1.1.1.1', '8.8.4.4']);
-
-// System-level HTTP agent configuration to prevent EMFILE
-const httpAgent = new http.Agent({
-    keepAlive: true,
-    keepAliveMsecs: 30000,
-    maxSockets: 500, // INCREASED from 200 to 500 for better throughput
-    maxFreeSockets: 200, // INCREASED from 100 to 200 for better connection reuse
-    timeout: 30000, // INCREASED from 20000 to 30000
-    scheduling: 'fifo',
-    // Enhanced connection management
-    createConnection: (options, callback) => {
-        const socket = http.createConnection(options);
-        socket.setKeepAlive(true, 30000);
-        socket.setTimeout(30000);
-        callback(null, socket);
-    }
-});
-
-const httpsAgent = new https.Agent({
-    keepAlive: true,
-    keepAliveMsecs: 30000,
-    maxSockets: 500, // INCREASED from 200 to 500 for better throughput
-    maxFreeSockets: 200, // INCREASED from 100 to 200 for better connection reuse
-    timeout: 30000, // INCREASED from 20000 to 30000
-    scheduling: 'fifo',
-    rejectUnauthorized: false, // Allow self-signed certificates
-    // Enhanced connection management
-    createConnection: (options, callback) => {
-        const socket = https.createConnection(options);
-        socket.setKeepAlive(true, 30000);
-        socket.setTimeout(30000);
-        callback(null, socket);
-    }
-});
-
-// Override default agents globally
-http.globalAgent = httpAgent;
-https.globalAgent = httpsAgent;
-
-// System-level connection manager for EMFILE prevention
-class SystemConnectionManager {
-    constructor() {
-        this.maxGlobalConnections = crawlerConfig.maxGlobalConnections || 5000; // INCREASED from 2000 to 5000
-        this.maxDomainConnections = crawlerConfig.maxConnectionsPerDomain || 10;  // INCREASED from 5 to 10
-        this.activeConnections = 0;
-        this.connectionsByDomain = new Map();
-        this.queuedRequests = [];
-        this.requestTimeout = crawlerConfig.queueTimeoutMs || 45000; // INCREASED from 30000 to 45000
-        this.lastEmfileWarning = 0;
-        this.maxQueueSize = crawlerConfig.maxQueueSize || 10000; // INCREASED from 5000 to 10000
-        this.enableBackpressure = crawlerConfig.enableBackpressure || true;
-        this.backpressureThreshold = crawlerConfig.backpressureThreshold || 0.8;
-        this.adaptiveDelay = crawlerConfig.adaptiveDelay || true;
-        this.maxAdaptiveDelayMs = crawlerConfig.maxAdaptiveDelayMs || 15000; // INCREASED from 10000 to 15000
-        
-        // Enhanced connection tracking
-        this.connectionHistory = new Map(); // Track connection usage patterns
-        this.domainStats = new Map(); // Track domain-specific statistics
-        this.lastCleanup = Date.now();
-        this.cleanupInterval = 60000; // Cleanup every minute
-        
-        // Circuit breaker for problematic domains
-        this.domainCircuitBreakers = new Map();
-        this.circuitBreakerThreshold = 10; // Failures before opening circuit
-        this.circuitBreakerTimeout = 300000; // 5 minutes
-        
-        // Start monitoring
-        this.startMonitoring();
-        
-        logger.info('SystemConnectionManager initialized with enhanced settings', {
-            service: 'SystemConnectionManager',
-            maxGlobalConnections: this.maxGlobalConnections,
-            maxDomainConnections: this.maxDomainConnections,
-            maxQueueSize: this.maxQueueSize,
-            requestTimeout: this.requestTimeout,
-            enableBackpressure: this.enableBackpressure,
-            backpressureThreshold: this.backpressureThreshold,
-            circuitBreakerEnabled: true
-        });
-    }
-
-    startMonitoring() {
-        // Monitor system health every 5 seconds
-        setInterval(() => {
-            this.logStats();
-            this.cleanupStaleConnections();
-            this.processQueueMaintenance();
-        }, crawlerConfig.queueMonitoringInterval || 5000);
-    }
-
-    logStats() {
-        const connectionUtilization = this.activeConnections / this.maxGlobalConnections;
-        const queueUtilization = this.queuedRequests.length / this.maxQueueSize;
-        
-        // Warning at 60% connection utilization or 50% queue utilization
-        if (connectionUtilization > 0.6 || queueUtilization > 0.5) {
-            const now = Date.now();
-            // Only warn every 10 seconds to avoid spam
-            if (now - this.lastEmfileWarning > 10000) {
-                this.lastEmfileWarning = now;
-                logger.warn('Connection/Queue usage approaching limits', {
-                    service: 'SystemConnectionManager',
-                    activeConnections: this.activeConnections,
-                    maxConnections: this.maxGlobalConnections,
-                    queuedRequests: this.queuedRequests.length,
-                    maxQueueSize: this.maxQueueSize,
-                    connectionUtilization: Math.round(connectionUtilization * 100),
-                    queueUtilization: Math.round(queueUtilization * 100),
-                    connectionsByDomain: Object.fromEntries(this.connectionsByDomain),
-                    riskLevel: connectionUtilization > 0.8 || queueUtilization > 0.8 ? 'HIGH' : 'MEDIUM'
-                });
-            }
-        }
-        
-        // Emergency warning at 80% utilization
-        if (connectionUtilization > 0.8) {
-            logger.error('CRITICAL: Connection usage at dangerous levels', {
-                service: 'SystemConnectionManager',
-                activeConnections: this.activeConnections,
-                maxConnections: this.maxGlobalConnections,
-                utilizationPercent: Math.round(connectionUtilization * 100),
-                action: 'Consider stopping some crawlers immediately'
-            });
-        }
-
-        // Emergency warning for queue overflow risk
-        if (queueUtilization > 0.9) {
-            logger.error('CRITICAL: Queue near overflow', {
-                service: 'SystemConnectionManager',
-                queuedRequests: this.queuedRequests.length,
-                maxQueueSize: this.maxQueueSize,
-                queueUtilization: Math.round(queueUtilization * 100),
-                action: 'Applying emergency backpressure'
-            });
-        }
-    }
-
-    // NEW: Queue maintenance to clean up stale requests
-    processQueueMaintenance() {
-        const now = Date.now();
-        const staleTimeout = this.requestTimeout * 2; // Consider requests stale after 2x timeout
-        
-        this.queuedRequests = this.queuedRequests.filter(request => {
-            if (now - request.timestamp > staleTimeout) {
-                clearTimeout(request.timeout);
-                request.reject(new Error('Request expired in queue'));
-                return false;
-            }
-            return true;
-        });
-    }
-
-    cleanupStaleConnections() {
-        // Remove domains with zero connections
-        for (const [domain, count] of this.connectionsByDomain.entries()) {
-            if (count <= 0) {
-                this.connectionsByDomain.delete(domain);
-            }
-        }
-    }
-
-    // NEW: Calculate adaptive delay based on queue pressure
-    calculateAdaptiveDelay() {
-        if (!this.adaptiveDelay) return 0;
-        
-        const queuePressure = this.queuedRequests.length / this.maxQueueSize;
-        
-        if (queuePressure > this.backpressureThreshold) {
-            // Scale delay based on queue pressure
-            const scaleFactor = (queuePressure - this.backpressureThreshold) / (1 - this.backpressureThreshold);
-            return Math.min(this.maxAdaptiveDelayMs * scaleFactor, this.maxAdaptiveDelayMs);
-        }
-        
-        return 0;
-    }
-
-    async acquire(domain) {
-        // Check system-level safety first
-        if (!systemLimitsManager.isConnectionSafe()) {
-            throw new Error('System connection limit reached - EMFILE prevention');
-        }
-
-        // NEW: Apply adaptive delay if queue is under pressure
-        const adaptiveDelay = this.calculateAdaptiveDelay();
-        if (adaptiveDelay > 0) {
-            logger.debug('Applying adaptive delay due to queue pressure', {
-                service: 'SystemConnectionManager',
-                delayMs: adaptiveDelay,
-                queueSize: this.queuedRequests.length,
-                maxQueueSize: this.maxQueueSize
-            });
-            await new Promise(resolve => setTimeout(resolve, adaptiveDelay));
-        }
-
-        return new Promise((resolve, reject) => {
-            const request = {
-                domain,
-                resolve,
-                reject,
-                timestamp: Date.now(),
-                timeout: setTimeout(() => {
-                    const index = this.queuedRequests.indexOf(request);
-                    if (index > -1) {
-                        this.queuedRequests.splice(index, 1);
-                    }
-                    reject(new Error(`Connection timeout for domain: ${domain}`));
-                }, this.requestTimeout)
-            };
-
-            if (this.canAcquire(domain)) {
-                this.grantConnection(request);
-            } else {
-                this.queuedRequests.push(request);
-                
-                // IMPROVED: Better queue overflow handling
-                if (this.queuedRequests.length > this.maxQueueSize) {
-                    // Remove oldest requests instead of failing immediately
-                    const overflowCount = this.queuedRequests.length - this.maxQueueSize;
-                    const removedRequests = this.queuedRequests.splice(0, overflowCount);
-                    
-                    // Clean up removed requests
-                    removedRequests.forEach(removedRequest => {
-                        clearTimeout(removedRequest.timeout);
-                        removedRequest.reject(new Error('Queue overflow - request evicted'));
-                    });
-                    
-                    logger.warn('Queue overflow handled by evicting old requests', {
-                        service: 'SystemConnectionManager',
-                        evictedRequests: overflowCount,
-                        currentQueueSize: this.queuedRequests.length,
-                        maxQueueSize: this.maxQueueSize
-                    });
-                }
-            }
-        });
-    }
-
-    canAcquire(domain) {
-        const domainKey = this.extractDomainKey(domain);
-        
-        // Check circuit breaker
-        if (this.isCircuitBreakerOpen(domainKey)) {
-            return false;
-        }
-        
-        // Check global connection limit
-        if (this.activeConnections >= this.maxGlobalConnections) {
-            return false;
-        }
-        
-        // Check domain-specific limit
-        const domainCount = this.connectionsByDomain.get(domainKey) || 0;
-        return domainCount < this.maxDomainConnections;
-    }
-    
-    /**
-     * Enhanced connection acquisition with circuit breaker and adaptive delays
-     */
-    async acquireConnection(domain) {
-        const domainKey = this.extractDomainKey(domain);
-        
-        // Check circuit breaker
-        if (this.isCircuitBreakerOpen(domainKey)) {
-            throw new Error(`Circuit breaker open for domain: ${domainKey}`);
-        }
-        
-        // Check global connection limit
-        if (this.activeConnections >= this.maxGlobalConnections) {
-            // Apply backpressure
-            if (this.enableBackpressure) {
-                const utilization = this.activeConnections / this.maxGlobalConnections;
-                if (utilization >= this.backpressureThreshold) {
-                    const delay = this.calculateAdaptiveDelay(utilization);
-                    logger.warn('Applying backpressure due to high connection utilization', {
-                        utilization: `${(utilization * 100).toFixed(1)}%`,
-                        delay: `${delay}ms`,
-                        activeConnections: this.activeConnections,
-                        maxConnections: this.maxGlobalConnections
-                    });
-                    await new Promise(resolve => setTimeout(resolve, delay));
-                }
-            }
-            
-            // Queue the request if still at limit
-            if (this.activeConnections >= this.maxGlobalConnections) {
-                return this.queueRequest(domainKey);
-            }
-        }
-        
-        // Check domain-specific limit
-        const domainConnections = this.connectionsByDomain.get(domainKey) || 0;
-        if (domainConnections >= this.maxDomainConnections) {
-            return this.queueRequest(domainKey);
-        }
-        
-        // Acquire connection
-        this.activeConnections++;
-        this.connectionsByDomain.set(domainKey, domainConnections + 1);
-        
-        // Track connection usage
-        this.trackConnectionUsage(domainKey);
-        
-        logger.debug('Connection acquired', {
-            domain: domainKey,
-            activeConnections: this.activeConnections,
-            domainConnections: domainConnections + 1,
-            globalUtilization: `${(this.activeConnections / this.maxGlobalConnections * 100).toFixed(1)}%`
-        });
-        
-        return true;
-    }
-    
-    /**
-     * Enhanced connection release with cleanup
-     */
-    releaseConnection(domain) {
-        const domainKey = this.extractDomainKey(domain);
-        
-        if (this.activeConnections > 0) {
-            this.activeConnections--;
-        }
-        
-        const domainConnections = this.connectionsByDomain.get(domainKey) || 0;
-        if (domainConnections > 0) {
-            this.connectionsByDomain.set(domainKey, domainConnections - 1);
-        }
-        
-        // Process queued requests
-        this.processQueue();
-        
-        logger.debug('Connection released', {
-            domain: domainKey,
-            activeConnections: this.activeConnections,
-            domainConnections: Math.max(0, domainConnections - 1)
-        });
-    }
-    
-    /**
-     * Calculate adaptive delay based on system load
-     */
-    calculateAdaptiveDelay(utilization) {
-        if (!this.adaptiveDelay) return 0;
-        
-        const baseDelay = 100; // Base delay in ms
-        const maxDelay = this.maxAdaptiveDelayMs;
-        
-        // Exponential increase based on utilization
-        const multiplier = Math.pow(utilization, 2);
-        const delay = Math.min(baseDelay * multiplier, maxDelay);
-        
-        // Add jitter to prevent thundering herd
-        const jitter = Math.random() * delay * 0.1;
-        
-        return Math.floor(delay + jitter);
-    }
-    
-    /**
-     * Track connection usage patterns for optimization
-     */
-    trackConnectionUsage(domainKey) {
-        const now = Date.now();
-        const history = this.connectionHistory.get(domainKey) || [];
-        
-        history.push(now);
-        
-        // Keep only recent history (last hour)
-        const cutoff = now - 3600000; // 1 hour
-        const recentHistory = history.filter(timestamp => timestamp > cutoff);
-        
-        this.connectionHistory.set(domainKey, recentHistory);
-        
-        // Update domain statistics
-        const stats = this.domainStats.get(domainKey) || {
-            totalConnections: 0,
-            averageConnections: 0,
-            peakConnections: 0,
-            lastUpdated: now
-        };
-        
-        stats.totalConnections++;
-        stats.averageConnections = recentHistory.length / 60; // Average per minute
-        stats.peakConnections = Math.max(stats.peakConnections, recentHistory.length);
-        stats.lastUpdated = now;
-        
-        this.domainStats.set(domainKey, stats);
-    }
-    
-    /**
-     * Circuit breaker implementation for problematic domains
-     */
-    isCircuitBreakerOpen(domainKey) {
-        const breaker = this.domainCircuitBreakers.get(domainKey);
-        if (!breaker) return false;
-        
-        const now = Date.now();
-        if (breaker.state === 'OPEN' && now < breaker.nextAttempt) {
-            return true;
-        }
-        
-        if (breaker.state === 'OPEN' && now >= breaker.nextAttempt) {
-            breaker.state = 'HALF_OPEN';
-            breaker.halfOpenRequests = 0;
-        }
-        
-        return false;
-    }
-    
-    /**
-     * Record failure for circuit breaker
-     */
-    recordFailure(domainKey) {
-        const breaker = this.domainCircuitBreakers.get(domainKey) || {
-            failures: 0,
-            state: 'CLOSED',
-            nextAttempt: 0,
-            halfOpenRequests: 0
-        };
-        
-        breaker.failures++;
-        
-        if (breaker.state === 'HALF_OPEN') {
-            breaker.halfOpenRequests++;
-            if (breaker.halfOpenRequests >= 3) {
-                breaker.state = 'OPEN';
-                breaker.nextAttempt = Date.now() + this.circuitBreakerTimeout;
-            }
-        } else if (breaker.failures >= this.circuitBreakerThreshold) {
-            breaker.state = 'OPEN';
-            breaker.nextAttempt = Date.now() + this.circuitBreakerTimeout;
-        }
-        
-        this.domainCircuitBreakers.set(domainKey, breaker);
-        
-        logger.warn('Circuit breaker failure recorded', {
-            domain: domainKey,
-            failures: breaker.failures,
-            state: breaker.state,
-            threshold: this.circuitBreakerThreshold
-        });
-    }
-    
-    /**
-     * Record success for circuit breaker
-     */
-    recordSuccess(domainKey) {
-        const breaker = this.domainCircuitBreakers.get(domainKey);
-        if (breaker && breaker.state === 'HALF_OPEN') {
-            breaker.state = 'CLOSED';
-            breaker.failures = 0;
-            breaker.halfOpenRequests = 0;
-            this.domainCircuitBreakers.set(domainKey, breaker);
-            
-            logger.info('Circuit breaker reset to CLOSED', { domain: domainKey });
-        }
-    }
-
-    grantConnection(request) {
-        const { domain, resolve, timeout } = request;
-        
-        this.activeConnections++;
-        const currentDomainCount = this.connectionsByDomain.get(domain) || 0;
-        this.connectionsByDomain.set(domain, currentDomainCount + 1);
-        
-        // Track with system limits manager
-        systemLimitsManager.incrementConnections();
-        
-        clearTimeout(timeout);
-        resolve();
-    }
-
-    release(domain) {
-        this.activeConnections = Math.max(0, this.activeConnections - 1);
-        
-        if (domain) {
-            const currentCount = this.connectionsByDomain.get(domain) || 0;
-            this.connectionsByDomain.set(domain, Math.max(0, currentCount - 1));
-        }
-
-        // Track with system limits manager
-        systemLimitsManager.decrementConnections();
-
-        // Process next queued request
-        this.processQueue();
-    }
-
-    processQueue() {
-        if (this.queuedRequests.length === 0) return;
-
-        // Sort by timestamp for fairness
-        this.queuedRequests.sort((a, b) => a.timestamp - b.timestamp);
-
-        // NEW: Process multiple requests if possible (up to 3 at once)
-        let processed = 0;
-        const maxProcessPerCycle = 3;
-        
-        for (let i = this.queuedRequests.length - 1; i >= 0 && processed < maxProcessPerCycle; i--) {
-            const request = this.queuedRequests[i];
-            if (this.canAcquire(request.domain)) {
-                this.queuedRequests.splice(i, 1);
-                this.grantConnection(request);
-                processed++;
-            }
-        }
-    }
-
-    getStats() {
-        return {
-            activeConnections: this.activeConnections,
-            maxGlobalConnections: this.maxGlobalConnections,
-            queuedRequests: this.queuedRequests.length,
-            maxQueueSize: this.maxQueueSize,
-            queueUtilization: Math.round((this.queuedRequests.length / this.maxQueueSize) * 100),
-            connectionUtilization: Math.round((this.activeConnections / this.maxGlobalConnections) * 100),
-            connectionsByDomain: Object.fromEntries(this.connectionsByDomain)
-        };
-    }
-
-    extractDomainKey(domain) {
-        // If domain is a URL, extract the hostname
-        try {
-            if (typeof domain === 'string') {
-                if (domain.startsWith('http://') || domain.startsWith('https://')) {
-                    return new URL(domain).hostname.toLowerCase();
-                }
-                // Remove port if present
-                return domain.split(':')[0].toLowerCase();
-            }
-            return String(domain).toLowerCase();
-        } catch (e) {
-            return domain;
-        }
-    }
+if (process.env.DNS_SERVERS) {
+    dns.setServers(process.env.DNS_SERVERS.split(','));
 }
 
-// Global system manager instance
-const systemConnectionManager = new SystemConnectionManager();
+const DEFAULT_MAX_PAGES = 2000;
+const RECRAWL_SAMPLE_SIZE = 100; // how many existing pages to re-check for content change
+const POLITENESS_DELAY_MS = 2000;
 
-// Global enhanced error handling components
-
-// Create handler instances
-const htmlHandler = new HtmlHandler();
-const documentHandler = new DocumentHandler();
-const imageHandler = new ImageHandler();
-
-class CrawlerCore {
-    constructor(db_row, con, options = {}) {
-        this.db_row = db_row;
-        this.con = con;
-        this.options = {
-            maxRetries: options.maxRetries || 2,
-            timeout: options.timeout || 30000,
-            userAgent: options.userAgent || this.getRandomUserAgent(),
-            proxy: options.proxy || this.getRandomProxy(),
-            respectRobots: options.respectRobots !== false,
-            ...options
-        };
-        
-        this.site_data_db_row = {};
-        this.$ = null;
-        this.currentUrl = null;
-        this.retryCount = 0;
-        this.crawlQueue = new Set(); // Queue to track URLs to crawl
-        this.crawledUrls = new Set(); // Track crawled URLs to avoid infinite loops
-        
-        // Enhanced error handling components (references to global instances)
-        this.errorHandler = new ErrorHandler(this.options);
-        
-        // Initialize unified duplicate checker with site-aware features
-        this.siteAwareDuplicateChecker = duplicateChecker;
-        this.siteAwareDuplicateChecker.setDatabaseConnection(con);
-        
-        // Initialize ContentIndexer for proper database storage
-        this.contentIndexer = new ContentIndexer(con);
-        
-        // Smart crawling statistics
-        this.smartStats = {
-            siteId: db_row?.site_id || null,
-            siteUrl: db_row?.site_url || null,
-            totalUrlsDiscovered: 0,
-            newUrlsFound: 0,
-            duplicatesSkipped: 0,
-            httpRequestsSaved: 0,
-            crawlEfficiency: 0,
-            siteInitialized: false,
-            initializationTime: null,
-            crawlStartTime: null,
-            crawlEndTime: null,
-            indexedToDatabase: 0,
-            indexingErrors: 0,
-            failedUrls: 0
-        };
-        
-        // Reduced logging - only log essential info, not entire options object
-        logger.info('CrawlerCore initialized with smart crawling capabilities', { 
-            url: db_row?.site_url,
-            siteId: this.smartStats.siteId,
-            userAgent: this.options.userAgent,
-            respectRobots: this.options.respectRobots,
-            maxRetries: this.options.maxRetries,
-            timeout: this.options.timeout
-        });
+/**
+ * Smart incremental web crawler.
+ * - First crawl: BFS up to max_pages (default 2000) per site.
+ * - Subsequent crawls: only new URLs + optional sample of existing for content change.
+ * - Avoids re-crawling same URLs; uses DB + in-memory visited set.
+ */
+class Crawler {
+    constructor(siteRow) {
+        this.siteRow = siteRow;
+        this.siteId = siteRow.site_id;
+        this.url = siteRow.site_url;
+        this.domain = UrlValidator.getDomain(this.url);
+        this.rootDomain = UrlValidator.getRootDomain(this.domain);
+        this.maxPages = Math.min(Number(siteRow.max_pages) || DEFAULT_MAX_PAGES, DEFAULT_MAX_PAGES);
+        this.crawler = null;
+        this.dataHandler = new DataHandler(this.siteId);
+        this.indexer = new Indexer(this.siteId);
+        this.discoveredSubdomains = new Set();
+        // Incremental: known pages from DB (url_hash -> { status, content_hash })
+        this.existingPagesMap = new Map();
+        // Visited this run (url_hash) – do not queue again
+        this.visitedUrlHashes = new Set();
+        // BFS queue: list of { url, normalized } to crawl
+        this.queue = [];
+        // How many pages we've actually crawled this run
+        this.crawledThisRun = 0;
+        // Resolve promise when crawl session is done
+        this.drainResolve = null;
+        // Whether this is first crawl (no existing pages) or incremental
+        this.isFirstCrawl = true;
     }
 
-    getRandomUserAgent() {
-        try {
-            if (userAgents && userAgents.length > 0) {
-                const randomIndex = Math.floor(Math.random() * userAgents.length);
-                return userAgents[randomIndex];
-            }
-            return new UserAgent().toString();
-        } catch (error) {
-            logger.error('Error getting random user agent', error);
-            return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
-        }
-    }
-
-    getRandomProxy() {
-        try {
-            if (proxyList && proxyList.length > 0) {
-                const randomIndex = Math.floor(Math.random() * proxyList.length);
-                return proxyList[randomIndex];
-            }
-            return null;
-        } catch (error) {
-            logger.error('Error getting random proxy', error);
-            return null;
-        }
-    }
-
-    getRandomDelay() {
-        return Math.floor(Math.random() * (crawlerConfig.maxDelay - crawlerConfig.minDelay + 1)) + crawlerConfig.minDelay;
-    }
-
-    /**
-     * Initialize the crawler for a specific site
-     * This is the key method that loads existing URLs and prepares for smart URL filtering
-     */
-    async initializeForSite(siteId, siteUrl = null) {
-        try {
-            this.smartStats.crawlStartTime = Date.now();
-            
-            logger.info('Initializing smart crawler for site', { siteId, siteUrl });
-            
-            // Initialize site-aware duplicate checker
-            const initStartTime = Date.now();
-            const siteStats = await this.siteAwareDuplicateChecker.initializeForSite(siteId, siteUrl);
-            this.smartStats.initializationTime = Date.now() - initStartTime;
-            
-            // Update smart stats with site information
-            this.smartStats.siteId = siteId;
-            this.smartStats.siteUrl = siteUrl || siteStats.siteUrl;
-            this.smartStats.siteInitialized = true;
-            
-            logger.info('Site initialization completed', {
-                siteId,
-                totalCrawledUrls: siteStats.totalCrawledUrls,
-                urlsAddedToday: siteStats.urlsAddedToday,
-                crawlPriority: siteStats.crawlPriority,
-                estimatedNewUrls: siteStats.estimatedNewUrls,
-                initializationTime: this.smartStats.initializationTime
-            });
-            
-            // Decide if site should be crawled based on statistics
-            return this.shouldCrawlSite(siteStats);
-            
-        } catch (error) {
-            logger.error('Error initializing smart crawler for site', {
-                siteId,
-                siteUrl,
-                error: error.message
-            });
-            throw error;
-        }
-    }
-    
-    /**
-     * Determine if a site should be crawled based on its statistics
-     */
-    shouldCrawlSite(siteStats) {
-        const decision = {
-            shouldCrawl: true,
-            reason: 'normal_crawl',
-            action: 'full_crawl',
-            estimatedNewUrls: siteStats.estimatedNewUrls
-        };
-        
-        // Check for force crawl options (for news sites that need daily crawling)
-        if (this.options.forceCrawl || this.options.skipRecentCheck) {
-            decision.shouldCrawl = true;
-            decision.reason = 'forced_daily_crawl';
-            decision.action = 'full_crawl';
-            decision.estimatedNewUrls = Math.max(siteStats.estimatedNewUrls, 50); // Ensure minimum crawl
-            
-            logger.info('Site crawl decision made (forced daily crawl)', {
-                siteId: siteStats.siteId,
-                ...decision,
-                forceCrawl: this.options.forceCrawl,
-                skipRecentCheck: this.options.skipRecentCheck
-            });
-            
-            return decision;
-        }
-        
-        // Skip crawling if site was crawled today and has low estimated new URLs
-        if (siteStats.urlsAddedToday > 0 && siteStats.estimatedNewUrls < 10) {
-            decision.shouldCrawl = false;
-            decision.reason = 'recently_crawled_low_activity';
-            decision.action = 'skip';
-        }
-        // Limit crawling for large sites crawled recently
-        else if (siteStats.totalCrawledUrls > 5000 && siteStats.estimatedNewUrls < 50) {
-            decision.shouldCrawl = true;
-            decision.reason = 'large_site_limited_new_content';
-            decision.action = 'limited_crawl';
-            decision.estimatedNewUrls = Math.min(siteStats.estimatedNewUrls, 100);
-        }
-        // Full crawl for new sites or sites with lots of estimated new content
-        else if (siteStats.totalCrawledUrls === 0 || siteStats.estimatedNewUrls > 200) {
-            decision.shouldCrawl = true;
-            decision.reason = 'new_site_or_high_activity';
-            decision.action = 'full_crawl';
-        }
-        
-        logger.info('Site crawl decision made', {
-            siteId: siteStats.siteId,
-            ...decision
-        });
-        
-        return decision;
-    }
-
-    async checkRobotsTxt(url) {
-        // Bypass robots.txt entirely for forced crawls (e.g., news/day-based)
-        if (this.options.forceCrawl || !this.options.respectRobots) {
-            return true;
-        }
-
-        try {
-            const urlObj = new URL(url);
-            const robotsUrl = `${urlObj.protocol}//${urlObj.host}/robots.txt`;
-            
-            // Only log robots.txt check for new domains, not every URL
-            const domain = urlObj.hostname;
-            if (!this.robotsChecked) {
-                this.robotsChecked = new Set();
-            }
-            
-            if (!this.robotsChecked.has(domain)) {
-                logger.info('Checking robots.txt for domain', { domain, robotsUrl });
-                this.robotsChecked.add(domain);
-            }
-            
-            const response = await axios.get(robotsUrl, {
-                timeout: 10000,
-                headers: {
-                    'User-Agent': this.options.userAgent
-                }
-            });
-
-            const robots = RobotsParser(robotsUrl, response.data);
-            const isAllowed = robots.isAllowed(url, this.options.userAgent);
-            
-            if (!isAllowed) {
-                logger.warn('URL blocked by robots.txt', { url }); // Only log when blocked
-            }
-            return isAllowed;
-        } catch (error) {
-            // Only log robots.txt errors occasionally to prevent spam
-            if (Math.random() < 0.1) { // Log only 10% of robots.txt errors
-                logger.warn('Could not fetch robots.txt, allowing crawl', { url, error: error.message });
-            }
-            return true; // If robots.txt is not accessible, allow crawling
-        }
-    }
-
-    async crawlPage(url) {
-        try {
-            this.currentUrl = url;
-            
-            // Validate and clean URL
-            const validatedUrl = urlValidator.isValid(url);
-            if (!validatedUrl) {
-                throw new Error('Invalid URL format');
-            }
-            
-            // Use the cleaned URL if it was modified
-            if (validatedUrl !== true && validatedUrl !== url) {
-                logger.debug('Using cleaned URL', { original: url, cleaned: validatedUrl });
-                url = validatedUrl;
-                this.currentUrl = url;
-            }
-
-            // Check if URL was already crawled in this session to avoid infinite loops
-            if (this.crawledUrls.has(url)) {
-                logger.info('URL already crawled in this session, skipping', { url });
-                return null;
-            }
-
-            // SMART CRAWLING: Use site-aware duplicate checker if available
-            if (this.siteAwareDuplicateChecker && this.smartStats.siteId) {
-                const isAlreadyCrawled = await this.siteAwareDuplicateChecker.isUrlAlreadyCrawled(
-                    url, 
-                    this.smartStats.siteId,
-                    this.options || {}
-                );
-                
-                if (isAlreadyCrawled) {
-                    this.smartStats.duplicatesSkipped++;
-                    this.smartStats.httpRequestsSaved++;
-                    
-                    logger.debug('URL skipped - already crawled (smart check)', { 
-                        url,
-                        siteId: this.smartStats.siteId
-                    });
-                    
-                    return {
-                        success: true,
-                        url,
-                        isDuplicate: true,
-                        message: 'Pre-crawl duplicate detected - URL already crawled',
-                        extractedLinks: [],
-                        httpRequestSaved: true
-                    };
-                }
-            } else {
-                // Fallback to regular duplicate checking
-            const siteId = this.db_row?.site_id;
-            const isAlreadyCrawled = await duplicateChecker.isUrlAlreadyCrawled(url, siteId);
-            
-            if (isAlreadyCrawled) {
-                logger.info('URL already crawled previously (pre-crawl check), skipping HTTP request', { 
-                    url, 
-                    siteId 
-                });
-                
-                // Add to session crawled URLs to prevent re-checking
-                this.crawledUrls.add(url);
-                
-                // Return a result indicating this is a duplicate but don't waste resources
-                return {
-                    success: true,
-                    url: url,
-                    isDuplicate: true,
-                    shouldSkipIndexing: true,
-                    extractedLinks: [], // No links extracted since we didn't fetch the page
-                    message: 'URL already crawled (pre-crawl duplicate check)'
-                };
-                }
-            }
-
-            // Add to crawled URLs set immediately to prevent re-crawling in this session
-            this.crawledUrls.add(url);
-
-            // Check robots.txt
-            if (!(await this.checkRobotsTxt(url))) {
-                logger.info('URL blocked by robots.txt', { url });
-                return null;
-            }
-
-            // Monitor resources
-            const resourceStatus = resourceMonitor.checkResources();
-            if (!resourceStatus.canContinue) {
-                logger.warn('Resource limits reached, pausing crawl', resourceStatus);
-                await this.delay(resourceStatus.suggestedDelay);
-            }
-
-            // Perform the actual crawl - only for non-duplicate URLs
-            logger.debug('Starting HTTP request for URL (passed pre-crawl checks)', { url });
-            let result = await this.performCrawl(url);
-            
-            // If result is null (CAPTCHA detected), try with different user agent
-            if (!result && this.isCaptchaProtectedSite(url)) {
-                logger.info('CAPTCHA detected, retrying with different user agent', { url });
-                await this.delay(2000); // Wait 2 seconds before retry
-                result = await this.performCrawlWithDifferentUserAgent(url);
-            }
-            
-            // Process the crawl result
-            if (result && result.parsedData) {
-                // Extract internal links for continued crawling
-                let extractedLinks = [];
+    async checkRobotsTxt(domain, userAgent = 'mybot') {
+        return new Promise((resolve, reject) => {
+            request(`${domain}/robots.txt`, (err, res, body) => {
+                if (err) return resolve(true);
+                if (res && res.statusCode === 404) return resolve(true);
                 try {
-                    extractedLinks = await this.extractInternalLinks(result.parsedData, url);
-                result.extractedLinks = extractedLinks;
-                } catch (extractError) {
-                    logger.error('Error extracting internal links', { 
-                        url, 
-                        error: extractError.message,
-                        stack: extractError.stack 
-                    });
-                    result.extractedLinks = [];
-                    extractedLinks = [];
+                    const robots = robotsParser(`${domain}/robots.txt`, body || '');
+                    const isAllowed = robots.isAllowed(this.url, userAgent);
+                    resolve(isAllowed);
+                } catch {
+                    resolve(true);
                 }
-                
-                // Add new links to crawl queue with smart filtering
-                if (extractedLinks.length > 0) {
-                    try {
-                        if (this.siteAwareDuplicateChecker && this.smartStats.siteId) {
-                            await this.addLinksToQueueSmart(extractedLinks, this.smartStats.siteId);
-                        } else {
-                            await this.addLinksToQueue(extractedLinks, this.db_row?.site_id);
+            });
+        });
+    }
+
+    /** Load existing site_data URL hashes (and content_hash) for incremental crawl. */
+    async loadExistingPages() {
+        this.existingPagesMap = await DataHandler.getExistingPagesMap(this.siteId);
+        for (const hash of this.existingPagesMap.keys()) {
+            this.visitedUrlHashes.add(hash);
+        }
+        this.isFirstCrawl = this.existingPagesMap.size === 0;
+        logger.info(`Site ${this.domain}: existing pages=${this.existingPagesMap.size}, firstCrawl=${this.isFirstCrawl}`);
+    }
+
+    /** Normalize and ensure same-domain; return null if external. */
+    normalizeInternalUrl(currentUrl, href) {
+        if (!href || href.includes('@')) return null;
+        try {
+            const resolved = UrlValidator.resolveUrl(currentUrl, href);
+            const norm = UrlValidator.normalizeUrl(resolved);
+            const targetDomain = UrlValidator.getDomain(norm);
+            if (!UrlValidator.isRelatedDomain(targetDomain, this.rootDomain)) return null;
+            return norm;
+        } catch {
+            return null;
+        }
+    }
+
+    /** Add URL to BFS queue if not already visited and under limit. */
+    enqueueIfNew(url) {
+        const urlHash = UrlValidator.generateUrlHash(url);
+        if (this.visitedUrlHashes.has(urlHash)) return;
+        if (this.crawledThisRun + this.queue.length >= this.maxPages) return;
+        this.visitedUrlHashes.add(urlHash);
+        this.queue.push(url);
+    }
+
+    /** Get next URL to crawl from queue. */
+    nextInQueue() {
+        return this.queue.shift() || null;
+    }
+
+    async readyPage(entryUrl) {
+        return new Promise(async (resolve, reject) => {
+            try {
+                logger.info(`Starting crawl for domain: ${this.domain} (max ${this.maxPages} pages this run)`);
+
+                await this.loadExistingPages();
+                try {
+                    await db.query(`UPDATE sites SET crawl_status = 'active' WHERE site_id = ?`, [this.siteId]);
+                } catch (e) { /* crawl_status column may not exist yet */ }
+
+                const proxyOptions = proxyManager.getProxyOptions();
+                const defaultHeaders = headers.getDefaultHeaders();
+
+                this.crawler = new CrawlerLib({
+                    maxConnections: crawlerConfig.maxConnections,
+                    timeout: crawlerConfig.timeout,
+                    rateLimit: Math.max(crawlerConfig.rateLimit, crawlerConfig.crawlDelay || POLITENESS_DELAY_MS),
+                    retries: crawlerConfig.retries,
+                    retryTimeout: crawlerConfig.retryTimeout,
+                    agent: proxyOptions.agent,
+                    strictSSL: crawlerConfig.strictSSL,
+                    rejectUnauthorized: crawlerConfig.rejectUnauthorized,
+                    gzip: crawlerConfig.gzip,
+                    preRequest: (options, done) => {
+                        try {
+                            if (proxyManager.enabled) {
+                                options.proxy = proxyManager.proxyUrl;
+                                options.tunnel = false;
+                            }
+                            if (options.uri && options.uri.startsWith('https')) {
+                                options.headers = options.headers || {};
+                                Object.assign(options.headers, defaultHeaders);
+                                options.strictSSL = false;
+                                options.rejectUnauthorized = false;
+                            }
+                            done();
+                        } catch (error) {
+                            logger.error(`Error in preRequest: ${error.message}`);
+                            done();
                         }
-                    } catch (queueError) {
-                        logger.error('Error adding links to queue', { 
-                            url, 
-                            error: queueError.message 
-                        });
+                    },
+                    jQuery: {
+                        name: 'cheerio',
+                        options: {
+                            normalizeWhitespace: true,
+                            xmlMode: false,
+                            decodeEntities: true
+                        }
+                    },
+                    headers: defaultHeaders,
+                    callback: async (error, res, done) => {
+                        await this.handleResponse(error, res, done);
                     }
-                }
-                
-                logger.info('Page crawled successfully with links extracted', { 
-                    url, 
-                    linksFound: extractedLinks.length
                 });
 
-                // SMART CRAWLING: Index content to database if available
-                if (this.contentIndexer && this.smartStats.siteId && result.success !== false && !result.isDuplicate) {
-                    try {
-                        logger.debug('Starting content indexing for crawled URL', { 
-                            url, 
-                            siteId: this.smartStats.siteId,
-                            hasTitle: !!result.parsedData.title,
-                            hasContent: !!result.parsedData.article || !!result.parsedData.content
-                        });
-                        
-                        const indexResult = await this.contentIndexer.indexContent(
-                            result.parsedData,
-                            url,
-                            this.smartStats.siteId
-                        );
-                        
-                        if (indexResult.success) {
-                            this.smartStats.indexedToDatabase++;
-                            
-                            logger.info('Content indexed successfully to database', {
-                                url,
-                                siteId: this.smartStats.siteId,
-                                dbId: indexResult.dbId,
-                                elasticId: indexResult.elasticId,
-                                isDuplicate: indexResult.isDuplicate
-                            });
-                            
-                            // Add indexing info to result
-                            result.indexResult = indexResult;
-                        } else {
-                            this.smartStats.indexingErrors++;
-                            logger.warn('Content indexing failed', {
-                                url,
-                                siteId: this.smartStats.siteId,
-                                error: indexResult.message || 'Unknown indexing error'
-                            });
-                        }
-                        
-                    } catch (indexingError) {
-                        this.smartStats.indexingErrors++;
-                        logger.error('Error during content indexing', {
-                            url,
-                            siteId: this.smartStats.siteId,
-                            error: indexingError.message,
-                            stack: indexingError.stack
-                        });
-                        
-                        // Don't fail the crawl if indexing fails
-                        result.indexError = indexingError.message;
-                    }
-                }
+                this.drainResolve = resolve;
+                // Always queue base URL so we (re)discover links (first crawl + incremental)
+                const entry = entryUrl || this.url;
+                const entryHash = UrlValidator.generateUrlHash(entry);
+                this.visitedUrlHashes.add(entryHash);
+                this.queue.push(entry);
+                this.setupDrainHandler();
 
-                // Mark URL as crawled in appropriate duplicate checker
-                if (this.siteAwareDuplicateChecker && this.smartStats.siteId) {
-                    await this.siteAwareDuplicateChecker.markAsCrawled(
-                        url,
-                        result.parsedData ? JSON.stringify(result.parsedData) : null,
-                        this.smartStats.siteId
-                    );
+                const first = this.nextInQueue();
+                if (first) {
+                    logger.info(`Queueing first URL: ${first}`);
+                    setTimeout(() => this.crawler.queue(first), POLITENESS_DELAY_MS);
                 } else {
-                    await duplicateChecker.markAsCrawled(url, result.parsedData.content, this.db_row?.site_id);
+                    logger.info('No URLs to crawl.');
+                    resolve();
                 }
-                logger.debug('URL marked as crawled in duplicate checker', { url });
+            } catch (error) {
+                logger.error(`Error in readyPage: ${error.message}`);
+                reject(error);
             }
-            
-            return result;
-        } catch (error) {
-            // Reduce noise for common errors
-            if (error.message.includes('HTTP 404') || error.message.includes('HTTP 500') || error.message.includes('ETIMEDOUT')) {
-                logger.debug('Error in crawl page (common error)', {
-                    url,
-                    siteId: this.smartStats.siteId,
-                    error: error.message
-                });
-            } else {
-                logger.error('Error in crawlPage', { 
-                    url, 
-                    error: error.message,
-                    stack: error.stack 
-                });
-            }
-            throw error;
-        }
+        });
     }
 
-
-    /**
-     * Check if URL should be skipped based on patterns
-     */
-    shouldSkipUrl(url) {
-        const skipPatterns = [
-            /\/wp-admin\//,
-            /\/admin\//,
-            /\/login/,
-            /\/signin/i,
-            /\/users\/auth\//i,
-            /\/auth\//i,
-            /\/logout/,
-            /\/register/,
-            /\.(css|js|json|xml|txt|zip|rar|7z|tar|gz|mp3|mp4|avi|mov|wmv|exe|dmg|pkg|deb|rpm|pdf|doc|docx|xls|xlsx|ppt|pptx|jpg|jpeg|png|gif|bmp|svg|ico)(\?|$)/i,
-            /\/feed\//,
-            /\/rss/,
-            /\/api\//,
-            /\/ajax/,
-            /\/xmlrpc\.php/,  // WordPress XML-RPC endpoints (cause HTTP 405)
-            /\/feeds\/.*\/comments/, // Comment feeds (often cause ENOTFOUND)
-            /\/wp-json\//,     // WordPress REST API (often requires auth)
-            /\/users\/.*\/charts/, // User-specific content (often requires auth)
-            /\/Special:/i, // MediaWiki maintenance pages
-            /\?.*utm_/,
-            /\#/,
-            /mailto:/,
-            /tel:/,
-            /javascript:/,
-            /^data:/,
-            /^blob:/,
-            /^about:/
-        ];
-        
-        // Additional checks for problematic domains/patterns
-        try {
-            const urlObj = new URL(url);
-            
-            // Skip URLs with suspicious TLDs that often don't resolve
-            const suspiciousTlds = ['.test', '.local', '.localhost', '.invalid'];
-            if (suspiciousTlds.some(tld => urlObj.hostname.endsWith(tld))) {
-                return true;
+    async handleResponse(error, res, done) {
+        if (error) {
+            logger.error(`Error crawling URL: ${res?.options?.uri || 'unknown'} - ${error.message}`);
+            if (proxyManager.shouldRetryWithoutProxy && proxyManager.shouldRetryWithoutProxy(error) && res?.options?.uri) {
+                setTimeout(() => {
+                    this.crawler.queue({
+                        uri: res.options.uri,
+                        priority: 1,
+                        proxy: null,
+                        tunnel: false,
+                        agent: null,
+                        strictSSL: false,
+                        rejectUnauthorized: false,
+                        rateLimit: 5000,
+                        headers: headers.getDefaultHeaders()
+                    });
+                }, 5000);
             }
-            
-            // Skip URLs with too many subdomains (often broken)
-            const subdomainCount = urlObj.hostname.split('.').length - 2;
-            if (subdomainCount > 3) {
-                return true;
-            }
-            
-            // Skip known problematic domains that consistently return errors
-            const problematicDomains = [
-                'as.baidu.com',      // Often times out
-                'skipblast.com',     // Often times out
-                'blog.onedash.com',   // Often returns 500 errors
-                'idp.springernature.com',
-                'verify.shiksha.com'
-            ];
-            if (problematicDomains.some(domain => urlObj.hostname.includes(domain))) {
-                return true;
-            }
-
-            // Skip auth redirect targets for Springer/Nature communities
-            if (/springernature\.com\/auth/i.test(urlObj.href) || /users\/auth\/springer_nature/i.test(urlObj.href)) {
-                return true;
-            }
-            
-        } catch (error) {
-            // If URL parsing fails, skip it
-            return true;
-        }
-        
-        return skipPatterns.some(pattern => pattern.test(url));
-    }
-
-    /**
-     * Get count of existing URLs in database for a specific site
-     */
-    async getExistingUrlCount(siteId) {
-        try {
-            const query = `
-                SELECT COUNT(*) as count 
-                FROM site_data 
-                WHERE site_data_site_id = ? 
-                AND status IN ('indexed', 'pending', 'crawled')
-            `;
-            
-            const result = await this.con.query(query, [siteId]);
-            return result[0]?.count || 0;
-        } catch (error) {
-            logger.error('Failed to get existing URL count from database', {
-                siteId,
-                error: error.message
-            });
-            return 0;
-        }
-    }
-
-    /**
-     * Enhanced URL discovery with smart filtering
-     * This filters URLs BEFORE adding them to queue for maximum efficiency
-     */
-    async addLinksToQueueSmart(links, siteId = null) {
-        if (!Array.isArray(links) || links.length === 0) {
-            return [];
-        }
-        
-        const targetSiteId = siteId || this.smartStats.siteId;
-        if (!targetSiteId) {
-            logger.warn('No site ID available for smart URL filtering');
-            return super.addLinksToQueue(links, siteId);
-        }
-        
-        try {
-            // STEP 1: Filter URLs to find only new ones
-            logger.info('Starting smart URL filtering', {
-                siteId: targetSiteId,
-                totalUrls: links.length
-            });
-            
-            // Pass crawl options to respect force crawl settings
-            const crawlOptions = { 
-                forceCrawl: this.options.forceCrawl || false,
-                skipRecentCheck: this.options.skipRecentCheck || false,
-                allowRecrawl: this.options.allowRecrawl || false,
-                maxAge: this.options.maxAge || null,
-                crawlInterval: this.options.crawlInterval || null
-            };
-            
-            const newUrls = await this.siteAwareDuplicateChecker.findNewUrls(links, targetSiteId, crawlOptions);
-            
-            // Update statistics
-            this.smartStats.totalUrlsDiscovered += links.length;
-            this.smartStats.newUrlsFound += newUrls.length;
-            this.smartStats.duplicatesSkipped += (links.length - newUrls.length);
-            this.smartStats.httpRequestsSaved += (links.length - newUrls.length);
-            
-            // Calculate efficiency
-            this.smartStats.crawlEfficiency = this.smartStats.totalUrlsDiscovered > 0 ? 
-                Math.round((this.smartStats.newUrlsFound / this.smartStats.totalUrlsDiscovered) * 100) : 0;
-            
-            logger.info('Smart URL filtering completed', {
-                siteId: targetSiteId,
-                totalUrls: links.length,
-                newUrls: newUrls.length,
-                duplicatesSkipped: this.smartStats.duplicatesSkipped,
-                efficiency: this.smartStats.crawlEfficiency
-            });
-            
-            // STEP 2: Add only new URLs to the crawl queue
-            if (newUrls.length > 0) {
-                // Add URLs directly to queue without parent duplicate checking
-                // since we've already done smart filtering
-                let actuallyAdded = 0;
-                for (const url of newUrls) {
-                    if (!this.crawlQueue.has(url) && !this.crawledUrls.has(url)) {
-                        this.crawlQueue.add(url);
-                        actuallyAdded++;
-                    } else {
-                        logger.debug('Smart filtering: URL already in queue or crawled', { 
-                            url, 
-                            inQueue: this.crawlQueue.has(url),
-                            inCrawled: this.crawledUrls.has(url)
-                        });
-                    }
-                }
-                
-                logger.debug('URLs added directly to queue (smart filtering bypass)', {
-                    siteId: targetSiteId,
-                    urlsReturned: newUrls.length,
-                    urlsActuallyAdded: actuallyAdded,
-                    queueSize: this.crawlQueue.size
-                });
-                
-                return newUrls; // Return the URLs that were added
-            } else {
-                logger.info('No new URLs to add to queue', { siteId: targetSiteId });
-                return [];
-            }
-            
-        } catch (error) {
-            logger.error('Error in smart URL filtering', {
-                siteId: targetSiteId,
-                totalUrls: links.length,
-                error: error.message
-            });
-            
-            // Fallback to regular crawling if smart filtering fails
-            logger.warn('Smart filtering failed, using parent method', { siteId: targetSiteId });
-            await super.addLinksToQueue(links, siteId);
-            return links; // Return the original links
-        }
-    }
-
-    /**
-     * Add links to crawl queue (with batch DB duplicate check)
-     */
-    async addLinksToQueue(links, siteId = null) {
-        if (!links || !Array.isArray(links) || links.length === 0) {
+            await new Promise(r => setTimeout(r, 2000));
+            done();
+            this.scheduleNextOrDrain();
             return;
         }
-        
-        // Define crawl options for use throughout this method
-        const crawlOptions = { 
-            forceCrawl: this.options.forceCrawl || false,
-            skipRecentCheck: this.options.skipRecentCheck || false,
-            allowRecrawl: this.options.allowRecrawl || false,
-            crawlInterval: this.options.crawlInterval || null
-        };
-        
-        // First, find which URLs are NEW (not in database) - prioritize these
-        let newUrls = [];
-        try {
-            // Pass options to support forceCrawl in fallback scenarios
-            newUrls = await duplicateChecker.findNewUrls(links, siteId, crawlOptions);
-        } catch (e) {
-            logger.warn('New URL check failed, falling back to regular duplicate check', { error: e.message });
-            newUrls = []; // Fallback to empty new URLs
-        }
-        
-        // Prioritize new URLs by adding them first
-        const prioritizedLinks = [...newUrls, ...links.filter(url => !newUrls.includes(url))];
-        
-        // Batch DB check for already-crawled URLs
-        let alreadyCrawledHashes = new Set();
-        try {
-            alreadyCrawledHashes = await duplicateChecker.batchCheckUrlsInDatabase(links, siteId);
-        } catch (e) {
-            logger.warn('Batch DB duplicate check failed, falling back to in-memory only', { error: e.message });
-        }
-        
-        let addedCount = 0;
-        let skippedCount = 0;
-        let duplicateCount = 0;
-        let newUrlsAdded = 0;
-        
-        for (const link of prioritizedLinks) {
-            try {
-                const linkUrl = typeof link === 'string' ? link : link.url;
-                if (!linkUrl || typeof linkUrl !== 'string') {
-                    skippedCount++;
-                    continue;
-                }
-                
-                // Skip if already in session crawled URLs (unless forceCrawl is enabled for re-crawling)
-                if (this.crawledUrls.has(linkUrl)) {
-                    const isForceCrawl = crawlOptions.forceCrawl || crawlOptions.skipRecentCheck || crawlOptions.allowRecrawl;
-                    if (!isForceCrawl) {
-                    duplicateCount++;
-                        logger.debug('Skipping URL (already crawled in session)', { url: linkUrl, forceCrawl: isForceCrawl });
-                    continue;
-                    } else {
-                        // For force crawl, remove from crawled URLs to allow re-crawling
-                        this.crawledUrls.delete(linkUrl);
-                        logger.debug('Force crawl: Removing URL from crawled set for re-crawling', { url: linkUrl });
-                    }
-                }
-                
-                // Skip if already in queue (unless it's the same crawl session and we need to re-process)
-                if (this.crawlQueue.has(linkUrl)) {
-                    // Don't add duplicates to queue, but don't count as duplicate skip for force crawl
-                    const isForceCrawl = crawlOptions.forceCrawl || crawlOptions.skipRecentCheck || crawlOptions.allowRecrawl;
-                    if (!isForceCrawl) {
-                    duplicateCount++;
-                        logger.debug('Skipping URL (already in queue)', { url: linkUrl, forceCrawl: isForceCrawl });
-                    }
-                    continue;
-                }
-                
-                // Skip URLs that should be avoided
-                if (this.shouldSkipUrl(linkUrl)) {
-                    skippedCount++;
-                    continue;
-                }
-                
-                // Skip if already crawled in DB (unless forceCrawl is enabled)
-                const urlHash = duplicateChecker.hashUrl(duplicateChecker.normalizeUrls ? duplicateChecker.normalizeUrl(linkUrl) : linkUrl);
-                const isForceCrawl = crawlOptions.forceCrawl || crawlOptions.skipRecentCheck || crawlOptions.allowRecrawl;
-                if (alreadyCrawledHashes.has(urlHash) && !isForceCrawl) {
-                    duplicateCount++;
-                    logger.debug('Skipping URL (already in DB)', { url: linkUrl, forceCrawl: isForceCrawl });
-                    continue;
-                } else if (alreadyCrawledHashes.has(urlHash) && isForceCrawl) {
-                    logger.debug('Force crawl: Adding URL despite being in DB', { url: linkUrl, forceCrawl: isForceCrawl });
-                }
-                
-                // Add to queue
-                this.crawlQueue.add(linkUrl);
-                addedCount++;
-                
-                // Track new URLs added
-                if (newUrls.includes(linkUrl)) {
-                    newUrlsAdded++;
-                }
-                
-            } catch (error) {
-                logger.warn('Error processing link for queue', { link, error: error.message });
-                skippedCount++;
-            }
-        }
-        
-        if (addedCount > 0 || duplicateCount > 0) {
-            logger.debug('Links processed for crawl queue (with new URL prioritization)', {
-                total: links.length,
-                newUrlsFound: newUrls.length,
-                newUrlsAdded: newUrlsAdded,
-                added: addedCount,
-                skipped: skippedCount,
-                duplicates: duplicateCount,
-                queueSize: this.crawlQueue.size
-            });
-        }
-    }
 
-    /**
-     * Get next URL from crawl queue
-     */
-    getNextUrl() {
-        if (this.crawlQueue.size === 0) {
-            return null;
-        }
-        
-        const nextUrl = this.crawlQueue.values().next().value;
-        this.crawlQueue.delete(nextUrl);
-        return nextUrl;
-    }
+        const uri = res.options.uri;
+        logger.info(`Crawling URL: ${uri}`);
 
-    /**
-     * Check if there are more URLs to crawl
-     */
-    hasMoreUrls() {
-        return this.crawlQueue.size > 0;
-    }
-
-    /**
-     * Process the entire crawl queue - crawl all extracted links with smart crawling features
-     */
-    async processQueue(maxPages = 250, maxDepth = 3) {
-        try {
-            // Check existing URLs in database for informational purposes only
-        let existingUrlCount = 0;
-        let newUrlsToCrawl = maxPages; // Always crawl for new URLs regardless of existing count
-        
-            const siteId = this.smartStats.siteId || this.db_row?.site_id;
-            
-            if (siteId) {
-            try {
-                    existingUrlCount = await this.getExistingUrlCount(siteId);
-                
-                    logger.info('Smart crawler pre-crawl database check', {
-                        siteId: siteId,
-                    existingUrlsInDb: existingUrlCount,
-                    maxPagesLimit: maxPages,
-                    newUrlsTargetThisCrawl: newUrlsToCrawl,
-                    efficiency: `Will add up to ${newUrlsToCrawl} new URLs to existing ${existingUrlCount} URLs`
-                });
-                
-                // CHANGED: Always crawl for new URLs, regardless of existing count
-                // This allows continuous growth of the database
-                logger.info('Smart crawler: Always crawling for new URLs to grow database continuously', {
-                            siteId: siteId,
-                        existingUrls: existingUrlCount,
-                    targetNewUrls: newUrlsToCrawl,
-                    projectedTotal: existingUrlCount + newUrlsToCrawl
-                });
-                
-            } catch (error) {
-                    logger.warn('Smart crawler: Failed to check existing URLs, proceeding with full crawl', {
-                        siteId: siteId,
-                    error: error.message
-                });
-            }
-        }
-        
-            logger.info('Starting smart queue processing with database optimization', {
-                siteId: siteId,
-            maxPages: newUrlsToCrawl,
-            maxDepth,
-                queueSize: this.crawlQueue.size,
-            existingUrlsInDb: existingUrlCount
-        });
-            
-            const results = [];
-            let currentDepth = 0;
-            let duplicatesSkipped = 0;
-            let uniquePagesCrawled = 0;
-            let httpRequestsMade = 0;
-        
-        while (this.hasMoreUrls() && uniquePagesCrawled < newUrlsToCrawl && currentDepth < maxDepth) {
-            const batchSize = Math.min(10, this.crawlQueue.size);
-            const currentBatch = [];
-            
-            // Get URLs from queue
-            for (let i = 0; i < batchSize && this.hasMoreUrls(); i++) {
-                const url = this.getNextUrl();
-                if (url && !this.crawledUrls.has(url)) {
-                    currentBatch.push(url);
-                }
-            }
-            
-            if (currentBatch.length === 0) {
-                break; // No more valid URLs to process
-            }
-            
-                logger.debug('Processing queue batch with smart crawling', { 
-                depth: currentDepth,
-                batchSize: currentBatch.length,
-                queueSize: this.crawlQueue.size,
-                uniquePagesCrawled,
-                duplicatesSkipped,
-                httpRequestsMade
-            });
-            
-            // Process batch concurrently
-            const batchPromises = currentBatch.map(async (url) => {
-                try {
-                    const result = await this.crawlPage(url);
-                    
-                    if (result) {
-                        if (result.isDuplicate) {
-                            duplicatesSkipped++;
-                        } else {
-                            uniquePagesCrawled++;
-                            httpRequestsMade++;
-                        }
-                        
-                            // Add newly extracted links to queue with smart filtering
-                        if (result.extractedLinks) {
-                                if (this.siteAwareDuplicateChecker && this.smartStats.siteId) {
-                                    await this.addLinksToQueueSmart(result.extractedLinks, this.smartStats.siteId);
-                                } else {
-                                    await this.addLinksToQueue(result.extractedLinks, siteId);
-                                }
-                        }
-                    }
-                    
-                    return result;
-                } catch (error) {
-                    logger.error('Error processing URL in queue', { url, error: error.message });
-                    return { success: false, url, error: error.message };
-                }
-            });
-            
-            const batchResults = await Promise.allSettled(batchPromises);
-            
-            // Collect successful results
-            batchResults.forEach((result, index) => {
-                if (result.status === 'fulfilled' && result.value) {
-                    results.push(result.value);
-                } else if (result.status === 'rejected') {
-                    logger.error('Batch promise rejected', { 
-                        url: currentBatch[index], 
-                        error: result.reason 
+        if (res.body && typeof res.body === 'string') {
+            const proxyErrorPatterns = [
+                'ERROR: The requested URL could not be retrieved',
+                'Protocol error (TLS code: SQUID_ERR_SSL_HANDSHAKE)',
+                'dh key too small'
+            ];
+            if (proxyErrorPatterns.some(p => res.body.includes(p))) {
+                logger.error(`Detected proxy error page for ${uri}. Retrying without proxy.`);
+                setTimeout(() => {
+                    this.crawler.queue({
+                        uri,
+                        priority: 1,
+                        proxy: null,
+                        tunnel: false,
+                        agent: null,
+                        strictSSL: false,
+                        rejectUnauthorized: false,
+                        rateLimit: 5000,
+                        headers: headers.getDefaultHeaders()
                     });
-                }
-            });
-            
-            // Add delay between batches to be respectful
-            if (this.hasMoreUrls() && uniquePagesCrawled < newUrlsToCrawl) {
-                await this.delay(1000); // 1 second between batches
+                }, 5000);
+                done();
+                this.scheduleNextOrDrain();
+                return;
             }
-            
-            currentDepth++;
-            
-            logger.info('Queue batch completed', { 
-                depth: currentDepth - 1,
-                batchProcessed: batchResults.length,
-                queueRemaining: this.crawlQueue.size,
-                uniquePagesCrawled,
-                duplicatesSkipped,
-                httpRequestsMade,
-                efficiency: `${((uniquePagesCrawled + duplicatesSkipped) > 0 ? (uniquePagesCrawled / (uniquePagesCrawled + duplicatesSkipped)) * 100 : 0).toFixed(1)}%`
-            });
         }
-            
-            // Update end time for smart stats
-            this.smartStats.crawlEndTime = Date.now();
-            
-            // Update smart stats with database optimization info
-            this.smartStats.existingUrlsInDb = existingUrlCount;
-            this.smartStats.totalUrlsForSite = existingUrlCount + (results?.length || 0);
-        
-        const totalUrlsForSite = existingUrlCount + uniquePagesCrawled;
-        
-            // Log final smart statistics
-            this.logSmartCrawlResults();
-            
-            logger.info('Smart queue processing completed', {
-            totalResults: results.length,
-            uniquePagesCrawled,
-            duplicatesSkipped,
-            httpRequestsMade,
-            maxDepthReached: currentDepth,
-            finalQueueSize: this.crawlQueue.size,
-            existingUrlsInDb: existingUrlCount,
-            totalUrlsForSite: totalUrlsForSite,
-            efficiency: `${((uniquePagesCrawled + duplicatesSkipped) > 0 ? (uniquePagesCrawled / (uniquePagesCrawled + duplicatesSkipped)) * 100 : 0).toFixed(1)}%`,
-            resourceSavings: `Saved ${duplicatesSkipped} unnecessary HTTP requests`,
-            databaseOptimization: `Found ${existingUrlCount} existing URLs, crawled ${uniquePagesCrawled} new URLs (Total: ${totalUrlsForSite})`
-        });
-        
-        return results;
-            
-        } catch (error) {
-            logger.error('Error in smart queue processing', {
-                siteId: this.smartStats.siteId,
-                error: error.message
-            });
-            throw error;
+
+        let contentType = 'text/html';
+        if (res.headers && res.headers['content-type']) {
+            contentType = res.headers['content-type'].split(';')[0].toLowerCase();
+        }
+
+        if (ContentTypeHandler.isImage(contentType, uri)) {
+            await this.handleImage(uri, res.body, contentType);
+            done();
+            this.scheduleNextOrDrain();
+            return;
+        }
+
+        if (contentType.includes('text/html')) {
+            await this.handleHtml(uri, res);
+        } else {
+            await this.handleNonHtmlContent(uri, res.body, contentType);
+        }
+
+        this.crawledThisRun++;
+        done();
+        this.scheduleNextOrDrain();
+    }
+
+    /** After each page: queue next URL. Drain listener (set once) handles when queue is empty. */
+    scheduleNextOrDrain() {
+        if (this.crawledThisRun >= this.maxPages) {
+            logger.info(`Reached max pages (${this.maxPages}) for this site. Stopping.`);
+            this.queue = [];
+        }
+        const nextUrl = this.nextInQueue();
+        if (nextUrl) {
+            setTimeout(() => this.crawler.queue(nextUrl), crawlerConfig.crawlDelay || POLITENESS_DELAY_MS);
         }
     }
 
-    /**
-     * Properly encode URL to handle Unicode characters
-     */
-    encodeUrl(url) {
-        try {
-            const urlObj = new URL(url);
-            
-            // Encode the pathname to handle Unicode characters
-            urlObj.pathname = encodeURI(urlObj.pathname);
-            
-            return urlObj.toString();
-        } catch (error) {
-            logger.warn('Error encoding URL, using original', { url, error: error.message });
-            return url;
-        }
-    }
-
-    /**
-     * Properly decompress gzipped/deflated content
-     */
-    async decompressContent(body, headers) {
-        try {
-            const contentEncoding = headers['content-encoding'];
-            
-            if (!contentEncoding) {
-                // No compression, return Buffer
-                return Buffer.isBuffer(body) ? body : Buffer.from(body);
-            }
-            
-            // Convert body to Buffer if it's not already
-            const bodyBuffer = Buffer.isBuffer(body) ? body : Buffer.from(body);
-            
-            if (contentEncoding.includes('gzip')) {
-                logger.debug('Decompressing gzip content');
-                const decompressed = await new Promise((resolve, reject) => {
-                    zlib.gunzip(bodyBuffer, (err, result) => {
-                        if (err) reject(err);
-                        else resolve(result);
-                    });
-                });
-                return decompressed;
-            } else if (contentEncoding.includes('deflate')) {
-                logger.debug('Decompressing deflate content');
-                const decompressed = await new Promise((resolve, reject) => {
-                    zlib.inflate(bodyBuffer, (err, result) => {
-                        if (err) reject(err);
-                        else resolve(result);
-                    });
-                });
-                return decompressed;
-            } else if (contentEncoding.includes('br')) {
-                logger.debug('Decompressing brotli content');
-                const decompressed = await new Promise((resolve, reject) => {
-                    zlib.brotliDecompress(bodyBuffer, (err, result) => {
-                        if (err) reject(err);
-                        else resolve(result);
-                    });
-                });
-                return decompressed;
+    /** Call once after crawler is created to handle drain (no more work). */
+    setupDrainHandler() {
+        this.crawler.on('drain', () => {
+            const nextUrl = this.nextInQueue();
+            if (nextUrl) {
+                setTimeout(() => this.crawler.queue(nextUrl), crawlerConfig.crawlDelay || POLITENESS_DELAY_MS);
             } else {
-                // Unknown compression, try as-is
-                logger.warn('Unknown content encoding, treating as uncompressed', { contentEncoding });
-                return Buffer.isBuffer(body) ? body : Buffer.from(body);
+                logger.info('Crawler queue drained. Finishing site.');
+                this.onDrain();
             }
-        } catch (error) {
-            logger.error('Error decompressing content', { error: error.message });
-            // Fallback to original content as Buffer
-            return Buffer.isBuffer(body) ? body : Buffer.from(body);
-        }
+        });
     }
 
-    /**
-     * Detect charset from headers or meta tags. Defaults to utf-8.
-     */
-    detectCharset(headers = {}, buffer = Buffer.alloc(0)) {
+    async onDrain() {
         try {
-            const headerCt = headers['content-type'] || '';
-            const headerMatch = headerCt.match(/charset=([^;\s]+)/i);
-            if (headerMatch) {
-                return headerMatch[1].toLowerCase();
-            }
-            const head = buffer.toString('ascii', 0, Math.min(buffer.length, 4096));
-            const metaMatch = head.match(/<meta[^>]+charset=["']?([^"'>\s]+)/i) ||
-                              head.match(/<meta[^>]+content=["'][^"']*;\s*charset=([^"'>\s]+)/i);
-            if (metaMatch) {
-                return metaMatch[1].toLowerCase();
-            }
-        } catch (_) {}
-        return 'utf-8';
-    }
-
-    /**
-     * Decode buffer to string using detected charset. Fallbacks to utf8, then latin1.
-     */
-    decodeContent(buffer, charset = 'utf-8') {
-        try {
-            const cs = (charset || 'utf-8').toLowerCase();
-            if (cs.includes('utf')) return buffer.toString('utf8');
-            if (cs.includes('1252') || cs.includes('windows-1252') || cs.includes('latin1') || cs.includes('iso-8859-1')) {
-                return buffer.toString('latin1');
-            }
-            return buffer.toString('utf8');
+            await db.query(
+                `UPDATE sites SET site_last_crawl_date = NOW(), crawl_status = 'completed'
+                 WHERE site_id = ?`,
+                [this.siteId]
+            );
         } catch (e) {
-            try { return buffer.toString('utf8'); } catch (_) {}
-            try { return buffer.toString('latin1'); } catch (_) {}
-            return buffer.toString();
-        }
-    }
-
-    async performCrawl(url) {
-        const encodedUrl = this.encodeUrl(url);
-        const domain = this.getDomainInfo(url)?.hostname;
-        let attempt = 0;
-        let lastError = null;
-
-        // Check circuit breaker before attempting request
-
-        while (attempt < 3) { // Default max retries
-            attempt++;
-            const requestStartTime = Date.now();
-
             try {
-                // Acquire connection from pool with domain awareness
-                await systemConnectionManager.acquire(domain);
-                
-                const result = await this.executeHttpRequest(encodedUrl, url, domain, requestStartTime);
-
-                return result;
-
-            } catch (error) {
-                lastError = error;
-                const responseTime = Date.now() - requestStartTime;
-                
-                // Extract status code from error message if available
-                let statusCode = null;
-                const httpStatusMatch = error.message.match(/HTTP (\d{3})/);
-                if (httpStatusMatch) {
-                    statusCode = parseInt(httpStatusMatch[1]);
-                }
-
-                // Use ErrorHandler to determine retry strategy
-                const errorContext = {
-                    siteId: this.smartStats.siteId,
-                    url: url,
-                    domain: domain,
-                    attempt: attempt,
-                    statusCode: statusCode,
-                    responseTime: responseTime
-                };
-
-                const errorResult = await this.errorHandler.handleError(error, errorContext);
-
-                if (errorResult.shouldStop) {
-                    // Increment failed URL counter for stats
-                    if (this.smartStats) {
-                        this.smartStats.failedUrls = (this.smartStats.failedUrls || 0) + 1;
-                    }
-                    
-                    logger.error('Error threshold exceeded, stopping crawl', {
-                        url,
-                        error: error.message,
-                        siteId: this.smartStats.siteId
-                    });
-                    
-                    throw error;
-                }
-
-                if (!errorResult.shouldRetry || attempt >= 3) {
-                    // Increment failed URL counter for stats
-                    if (this.smartStats) {
-                        this.smartStats.failedUrls = (this.smartStats.failedUrls || 0) + 1;
-                    }
-                    
-                    logger.warn('Max retries exceeded or non-retryable error', {
-                        url,
-                        error: error.message,
-                        attempt,
-                        maxRetries: 3,
-                        shouldRetry: errorResult.shouldRetry
-                    });
-                    
-                    throw error;
-                }
-
-                // Wait before retry using ErrorHandler delay
-                if (errorResult.retryDelay > 0) {
-                    logger.debug('Waiting before retry', {
-                        url,
-                        attempt,
-                        delay: errorResult.retryDelay
-                    });
-                    await this.delay(errorResult.retryDelay);
-                }
-
-                logger.info('Retrying request with ErrorHandler strategy', {
-                    url,
-                    attempt,
-                    maxRetries: 3,
-                    retryDelay: errorResult.retryDelay
-                });
+                await db.query(`UPDATE sites SET site_last_crawl_date = NOW() WHERE site_id = ?`, [this.siteId]);
+            } catch (e2) {
+                logger.error(`Error updating site after drain: ${e2.message}`);
             }
         }
-
-        // If we get here, all retries have been exhausted
-        throw lastError;
+        if (this.drainResolve) this.drainResolve();
     }
 
-    async executeHttpRequest(encodedUrl, originalUrl, domain, startTime) {
-        return new Promise((resolve, reject) => {
-                    // Add timeout to prevent hanging requests
-                    const requestTimeoutId = setTimeout(() => {
-                logger.warn('Request timeout, force closing', { 
-                    url: originalUrl, 
-                    timeout: this.options.requestTimeout 
-                });
-                        systemConnectionManager.release(domain);
-                        reject(new Error('Request timeout'));
-                    }, (this.options.requestTimeout || 15000) + 5000);
-                    
-                    const crawler = new Crawler({
-                        maxConnections: 1,    // EXTREMELY conservative - only 1 connection
-                        rateLimit: 5000,      // 5 second delay between requests
-                        timeout: 10000,       // Reduced to 10 seconds
-                        retries: 0,           // No retries - we handle manually
-                        retryTimeout: 0,      // No retry delay
-                        userAgent: this.options.userAgent,
-                        proxy: this.options.proxy,
-                        headers: {
-                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                            'Accept-Language': 'en-US,en;q=0.5',
-                            'Accept-Encoding': 'gzip, deflate',
-                            'Connection': 'close', // Force connection close to prevent buildup
-                            'Cache-Control': 'no-cache',
-                            ...stealthHeaders
-                        },
-                        // Force use of our custom agents to respect system limits
-                agentClass: originalUrl.startsWith('https:') ? https.Agent : http.Agent,
-                agentOptions: originalUrl.startsWith('https:') ? {
-                            keepAlive: false,  // No keep-alive
-                            maxSockets: 1,     // Only 1 socket
-                            timeout: 10000,
-                            rejectUnauthorized: false
-                        } : {
-                            keepAlive: false,  // No keep-alive  
-                            maxSockets: 1,     // Only 1 socket
-                            timeout: 10000
-                        },
-                        // Minimal settings to prevent connection buildup
-                        jQuery: false,        // Don't load jQuery to save memory
-                        gzip: false,         // Disable automatic gzip (we handle manually)
-                        encoding: null,      // Get raw buffer for manual processing
-                        maxRedirects: 3,     // Limit redirects
-                        rejectUnauthorized: false,  // Accept self-signed certificates
-                        strictSSL: false,           // Disable strict SSL
-                        forever: false,             // No persistent connections
-                        pool: false,               // No connection pooling
-                        keepAlive: false,          // No keep-alive
-                        // Follow redirects, but some domains like nature.com loop on cookie pages
-                        followRedirect: true,      // Follow redirects
-                        followAllRedirects: false, // Don't follow all redirects
-                        callback: async (error, res, done) => {
-                            try {
-                                const loadTime = Date.now() - startTime;
-                                
-                                if (error) {
-                            // Enhanced error classification for different error types
-                            this.logEnhancedError(error, originalUrl, domain, loadTime);
-                            done();
-                            clearTimeout(requestTimeoutId);
-                            systemConnectionManager.release(domain);
-                            reject(error);
-                            return;
-                        }
+    async handleHtml(uri, res) {
+        const normalizedUri = UrlValidator.normalizeUrl(uri);
+        try {
+            if (typeof res.$ !== 'function') {
+                logger.warn(`No valid HTML returned for: ${uri}`);
+                return;
+            }
 
-                        if (!res) {
-                            const noResponseError = new Error('No response received');
-                            logger.error('No response received', { url: originalUrl, loadTime });
-                            done();
-                            clearTimeout(requestTimeoutId);
-                            systemConnectionManager.release(domain);
-                            reject(noResponseError);
-                            return;
-                        }
-
-                        // Handle known redirect-loop and auth domains
-                        const reqHref = res?.request?.uri?.href || originalUrl;
-                        if (/nature\.com\/.*cookies_not_supported/i.test(reqHref) || /idp\.springernature\.com\/auth/i.test(reqHref) || /users\/auth\/springer_nature/i.test(reqHref)) {
-                            done();
-                            clearTimeout(requestTimeoutId);
-                            systemConnectionManager.release(domain);
-                            reject(new Error('Redirect loop due to cookie wall'));
-                            return;
-                        }
-
-                        if (res.statusCode !== 200) {
-                            const statusCode = res.statusCode;
-                            const statusError = new Error(`HTTP ${statusCode}: ${res.statusMessage}`);
-                            
-                            // Enhanced status code handling
-                            this.handleHttpStatusCode(statusCode, originalUrl, res.statusMessage, loadTime);
-                            
-                            done();
-                            clearTimeout(requestTimeoutId);
-                            systemConnectionManager.release(domain);
-                            reject(statusError);
-                            return;
-                        }
-
-                        // Successful response processing
-                        const result = await this.processSuccessfulResponse(res, originalUrl, loadTime);
-                        
-                        done();
-                        clearTimeout(requestTimeoutId);
-                        systemConnectionManager.release(domain);
-                        resolve(result);
-                        
-                    } catch (processingError) {
-                        logger.error('Error processing crawled content', { 
-                            url: originalUrl, 
-                            error: processingError.message,
-                            stack: processingError.stack,
-                            loadTime: Date.now() - startTime
-                        });
-                        done();
-                        clearTimeout(requestTimeoutId);
-                        systemConnectionManager.release(domain);
-                        reject(processingError);
-                    }
+            const currentHost = UrlValidator.getDomain(uri);
+            if (UrlValidator.isRelatedDomain(currentHost, this.rootDomain) && currentHost !== this.rootDomain) {
+                if (!this.discoveredSubdomains.has(currentHost)) {
+                    this.discoveredSubdomains.add(currentHost);
+                    logger.info(`Processing subdomain: ${currentHost} of root domain: ${this.rootDomain}`);
                 }
-            });
+            }
 
-            // Add timeout handling with grace period
-            const timeoutId = setTimeout(() => {
-                logger.error('Crawler timeout exceeded', { 
-                    url: originalUrl, 
-                    timeout: this.options.timeout,
-                    actualTime: Date.now() - startTime
-                });
-                
-                // Clean up crawler resources properly
+            const parser = new Parser(this.siteId, null, uri, res.$);
+            const parsedData = await parser.parse();
+            const videos = parser.extractVideos();
+            const isMainPage = normalizedUri === UrlValidator.normalizeUrl(this.url);
+            const linkType = isMainPage ? 'main_page' : 'internal';
+
+            const siteData = await this.dataHandler.saveOrUpdateSiteData(normalizedUri, parsedData, linkType);
+
+            if (siteData && siteData.site_data_id) {
+                const imageHandler = new ImageHandler(this.siteId, siteData.site_data_id, uri);
+                await imageHandler.extractAndSaveImages(res.$, this.domain);
+
+                const documentHandler = new DocumentHandler(this.siteId, siteData.site_data_id, uri);
+                await documentHandler.extractAndSaveDocuments(res.$);
+
+                for (const video of videos) {
+                    await this.indexer.indexVideo(
+                        video.video,
+                        video.title,
+                        siteData.site_data_id,
+                        video.description || '',
+                        video.thumbnail || ''
+                    );
+                }
+                await this.dataHandler.updateStatus(normalizedUri, 'indexed');
+            }
+
+            this.extractLinks(res.$, uri);
+        } catch (error) {
+            logger.error(`Error handling HTML: ${error.message}`);
+            await this.dataHandler.updateStatus(normalizedUri, 'failed');
+        }
+    }
+
+    extractLinks($, currentUrl) {
+        const self = this;
+        $('a[href]').each(function () {
+            try {
+                const href = $(this).attr('href');
+                const normalized = self.normalizeInternalUrl(currentUrl, href);
+                if (normalized) self.enqueueIfNew(normalized);
+            } catch (e) { /* skip */ }
+        });
+    }
+
+    async handleImage(uri, body, contentType) {
+        try {
+            logger.info(`Processing image: ${uri}`);
+            let width = null, height = null;
+            if (Buffer.isBuffer(body)) {
                 try {
-                    if (crawler && crawler.queue) {
-                        crawler.queue = [];
+                    const sizeOf = require('image-size');
+                    if (sizeOf && typeof sizeOf === 'function') {
+                        const size = sizeOf(body);
+                        if (size) { width = size.width; height = size.height; }
                     }
-                    if (crawler && typeof crawler.stop === 'function') {
-                        crawler.stop();
-                    }
-                } catch (cleanupError) {
-                    logger.warn('Error during crawler cleanup', { 
-                        url: originalUrl, 
-                        error: cleanupError.message 
-                    });
-                }
-                
-                reject(new Error(`Crawler timeout after ${this.options.timeout}ms`));
-            }, this.options.timeout + 2000);
-
-            crawler.queue({
-                uri: encodedUrl,
-                timeout: this.options.requestTimeout || 15000,
-                retries: 0,
-                rateLimits: 0
-            });
-            
-            crawler.on('drain', () => {
-                clearTimeout(timeoutId);
-            });
-        });
-    }
-
-    logEnhancedError(error, url, domain, loadTime) {
-        // Simple error classification for logging
-        if (error.code === 'ENOTFOUND' || error.code === 'ENODATA') {
-            logger.debug('DNS resolution failed (domain not found)', { 
-                url, 
-                domain,
-                loadTime,
-                errorCode: error.code
-            });
-        } else if (error.code === 'ETIMEDOUT' || error.message.includes('timeout')) {
-            logger.debug('Request timeout (slow server)', { 
-                url, 
-                loadTime,
-                timeout: this.options.requestTimeout,
-                errorCode: error.code
-            });
-        } else if (error.code === 'ECONNREFUSED' || error.code === 'ECONNRESET') {
-            logger.debug('Connection error', { 
-                url, 
-                loadTime,
-                errorCode: error.code
-            });
-        } else {
-            logger.error('Crawler HTTP error', { 
-                url, 
-                error: error.message,
-                code: error.code,
-                loadTime
-            });
-        }
-    }
-
-    handleHttpStatusCode(statusCode, url, statusMessage, loadTime) {
-        // Simple status code classification
-        if ([403, 429, 503].includes(statusCode)) {
-            logger.info('Website blocking crawler (expected behavior)', { 
-                url, 
-                statusCode,
-                statusMessage
-            });
-        } else if (statusCode === 404) {
-            logger.debug('Page not found (404)', { 
-                url, 
-                statusCode
-            });
-        } else if (statusCode === 405) {
-            logger.debug('Method not allowed (405) - likely API endpoint', { 
-                url, 
-                statusCode,
-                hint: 'Skipping non-crawlable endpoint'
-            });
-        } else if ([502, 503].includes(statusCode)) {
-            logger.debug('Server temporarily unavailable', { 
-                url, 
-                statusCode
-            });
-        } else if (statusCode === 500) {
-            logger.debug('Internal server error (500)', { 
-                url, 
-                statusCode
-            });
-        } else {
-            logger.warn('Non-200 response', { 
-                url, 
-                statusCode,
-                statusMessage
-            });
-        }
-    }
-
-    async processSuccessfulResponse(res, url, loadTime) {
-                                const contentType = res.headers['content-type'] || '';
-                                const contentLength = res.body ? res.body.length : 0;
-                                
-                                // Capture response metadata
-                                const responseMetadata = {
-                                    statusCode: res.statusCode,
-                                    loadTime: loadTime,
-                                    redirectUrl: res.request && res.request.uri && res.request.uri.href !== url ? res.request.uri.href : null,
-                                    contentType: contentType,
-                                    contentLength: contentLength
-                                };
-                                
-                                logger.info('HTTP request successful', { 
-                                    url, 
-                                    contentType, 
-                                    contentLength,
-                                    statusCode: res.statusCode,
-                                    loadTime: loadTime
-                                });
-
-                                // Process based on content type
-                                let result;
-                
-                // Skip CSS and JavaScript files explicitly to prevent data corruption
-                if (contentType.includes('text/css') || contentType.includes('application/javascript') || contentType.includes('text/javascript')) {
-                    logger.info('Skipping CSS/JS file to prevent data corruption', { url, contentType });
-                    return null;
-                }
-                
-                if (contentType.includes('text/html')) {
-                    const decompressedBuffer = await this.decompressContent(res.body, res.headers);
-                    const charset = this.detectCharset(res.headers, decompressedBuffer);
-                    const decodedHtml = this.decodeContent(decompressedBuffer, charset);
-                    
-                    // Check for CAPTCHA challenges before processing
-                    if (this.isCaptchaChallenge(decodedHtml, url)) {
-                        logger.warn('CAPTCHA challenge detected, skipping page', { url, contentType });
-                        return null;
-                    }
-                    
-                                    logger.info('Routing content to table', { url, contentType, targetTable: 'site_data' });
-                                    logger.debug('Processing HTML content', { url });
-                    result = await htmlHandler.process(decodedHtml, url, this, responseMetadata);
-                                    logger.debug('HTML processing completed', { url, hasResult: !!result });
-                                } else if (contentType.includes('application/json')) {
-                                    logger.info('Routing content to table', { url, contentType, targetTable: 'site_data' });
-                                    logger.debug('Processing JSON content', { url });
-                                    try {
-                        const decompressedBuffer = await this.decompressContent(res.body, res.headers);
-                        let jsonText = decompressedBuffer.toString('utf8');
-                        let jsonData;
-                        try { jsonData = JSON.parse(jsonText); }
-                        catch (_) { jsonText = decompressedBuffer.toString('latin1'); jsonData = JSON.parse(jsonText); }
-                                        result = {
-                                            parsedData: {
-                                                title: jsonData.title || jsonData.name || `JSON Data from ${url}`,
-                                                description: jsonData.description || jsonData.summary || 'JSON API Response',
-                                                content: JSON.stringify(jsonData, null, 2),
-                                                article: JSON.stringify(jsonData, null, 2),
-                                                keywords: jsonData.keywords || jsonData.tags || [],
-                                                author: jsonData.author || '',
-                                                publishedTime: jsonData.publishedTime || jsonData.created_at || null,
-                                                modifiedTime: jsonData.modifiedTime || jsonData.updated_at || null,
-                                                language: jsonData.language || null,
-                                                canonical: url,
-                                                images: [],
-                                                links: [],
-                                                headings: { h1: '', h2: '', h3: '', h4: '' }
-                                            },
-                                            responseMetadata
-                                        };
-                                    } catch (jsonError) {
-                                        logger.debug('Skipping invalid JSON content', { url, error: jsonError.message });
-                                        result = null;
-                                    }
-                                    logger.debug('JSON processing completed', { url, hasResult: !!result });
-                                } else if (contentType.includes('application/pdf') ||
-                                          contentType.includes('application/msword') ||
-                                          contentType.includes('application/vnd.openxmlformats-officedocument.wordprocessingml.document') ||
-                                          contentType.includes('application/vnd.ms-excel') ||
-                                          contentType.includes('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet') ||
-                                          contentType.includes('application/vnd.ms-powerpoint') ||
-                                          contentType.includes('application/vnd.openxmlformats-officedocument.presentationml.presentation') ||
-                                          contentType.includes('text/plain') ||
-                                          contentType.includes('text/csv') ||
-                                          contentType.includes('text/css') ||
-                                          contentType.includes('application/rtf') ||
-                                          contentType.includes('application/vnd.oasis.opendocument.text') ||
-                                          contentType.includes('application/vnd.oasis.opendocument.spreadsheet') ||
-                                          contentType.includes('application/vnd.oasis.opendocument.presentation')) {
-                                    logger.info('Routing content to table', { url, contentType, targetTable: 'site_doc' });
-                                    logger.debug('Processing document content', { url, contentType });
-                                    result = await documentHandler.process(res.body, url, this, responseMetadata);
-                                } else if (contentType.includes('image/')) {
-                                    logger.info('Routing content to table', { url, contentType, targetTable: 'site_img' });
-                                    logger.debug('Processing image content', { url });
-                                    result = await imageHandler.process(res.body, url, this, responseMetadata);
-                                } else {
-                                    logger.warn('Unsupported content type', { url, contentType });
-                                    result = null;
-                                }
-
-                                logger.info('Content processing completed', { 
-                                    url, 
-                                    hasResult: !!result,
-                                    resultType: result ? typeof result : 'null'
-                                });
-
-        return result;
-    }
-
-    async delay(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
-    }
-
-    // Utility method to sanitize URLs
-    sanitizeUrl(url) {
-        try {
-            const urlObj = new URL(url);
-            // Remove fragments and normalize
-            urlObj.hash = '';
-            return urlObj.toString();
+                } catch (err) { /* ignore */ }
+            }
+            const imageHandler = new ImageHandler(this.siteId, null, uri);
+            await imageHandler.saveImage(
+                uri,
+                UrlValidator.getFilenameFromUrl(uri),
+                '',
+                width,
+                height
+            );
         } catch (error) {
-            logger.error('Error sanitizing URL', { url, error: error.message });
-            return url;
+            logger.error(`Error handling image: ${error.message}`);
         }
     }
 
-    // Method to get domain information
-    getDomainInfo(url) {
+    async handleNonHtmlContent(uri, body, contentType) {
         try {
-            const urlObj = new URL(url);
-            return {
-                hostname: urlObj.hostname,
-                protocol: urlObj.protocol,
-                port: urlObj.port || (urlObj.protocol === 'https:' ? '443' : '80'),
-                domain: urlObj.hostname.replace(/^www\./, '')
-            };
-        } catch (error) {
-            logger.error('Error parsing domain info', { url, error: error.message });
-            return null;
-        }
-    }
-
-    /**
-     * Generate site Title from URL and normalize URL (same logic as addsite.js)
-     */
-    generateSiteInfo(url) {
-        let domain, normalizedUrl, title;
-        
-        try {
-            // Add protocol if missing
-            if (!url.startsWith('http://') && !url.startsWith('https://')) {
-                url = 'https://' + url;
-            }
-            
-            const parsedUrl = new URL(url);
-            domain = parsedUrl.hostname.replace('www.', ''); // Remove 'www.' prefix if present
-            normalizedUrl = parsedUrl.href;
-            
-            // Generate a nice title from domain (same as addsite.js)
-            title = domain.split('.')[0];
-            title = title.charAt(0).toUpperCase() + title.slice(1);
-            
-        } catch (error) {
-            // If URL parsing fails, assume it's a domain without a scheme
-            domain = url.replace('www.', '').replace(/^https?:\/\//, '');
-            normalizedUrl = 'https://' + domain;
-            title = domain.split('.')[0];
-            title = title.charAt(0).toUpperCase() + title.slice(1);
-        }
-        
-        return { domain, url: normalizedUrl, title };
-    }    
-
-    /**
-     * Get comprehensive error statistics from all error handling components
-     */
-    getErrorStats() {
-        return {
-            errorHandler: this.errorHandler.getErrorStats(),
-            summary: {
-                timestamp: new Date().toISOString()
-            }
-        };
-    }
-
-    /**
-     * Get domain-specific error report
-     */
-    getDomainErrorReport(domain) {
-        return {
-            domain: domain
-        };
-    }
-
-    /**
-     * Generate comprehensive HTTP error report
-     */
-    async generateHttpErrorReport() {
-        return {
-            enhancedErrorHandling: {
-                recommendations: []
-            }
-        };
-    }
-
-    /**
-     * Generate enhanced recommendations based on error patterns
-     */
-    generateEnhancedRecommendations(errorStats, circuitBreakerStatus) {
-        const recommendations = [];
-        return recommendations;
-    }
-
-    /**
-     * Reset all error handling components
-     */
-    resetErrorHandling() {
-        this.errorHandler.resetErrorCounts();
-        logger.info('All error handling components reset', {
-            service: 'CrawlerCore'
-        });
-    }
-
-    /**
-     * Force open circuit breaker for a domain (for testing or emergency)
-     */
-    forceOpenCircuitBreaker(domain) {
-        logger.warn('Circuit breaker forced open', {
-            service: 'CrawlerCore',
-            domain
-        });
-    }
-
-    /**
-     * Force close circuit breaker for a domain
-     */
-    forceCloseCircuitBreaker(domain) {
-        logger.info('Circuit breaker forced closed', {
-            service: 'CrawlerCore',
-            domain
-        });
-    }
-
-    /**
-     * Log comprehensive smart crawl results
-     */
-    logSmartCrawlResults() {
-        const totalTime = this.smartStats.crawlEndTime - this.smartStats.crawlStartTime;
-        const siteStats = this.siteAwareDuplicateChecker ? this.siteAwareDuplicateChecker.getSiteStats(this.smartStats.siteId) : null;
-        
-        logger.info('Smart crawl completed - Final Results', {
-            siteId: this.smartStats.siteId,
-            siteUrl: this.smartStats.siteUrl,
-            performance: {
-                totalTime: Math.round(totalTime / 1000) + 's',
-                initializationTime: this.smartStats.initializationTime + 'ms',
-                crawlEfficiency: this.smartStats.crawlEfficiency + '%'
-            },
-            urls: {
-                totalDiscovered: this.smartStats.totalUrlsDiscovered,
-                newUrlsFound: this.smartStats.newUrlsFound,
-                duplicatesSkipped: this.smartStats.duplicatesSkipped,
-                httpRequestsSaved: this.smartStats.httpRequestsSaved
-            },
-            database: {
-                indexedToDatabase: this.smartStats.indexedToDatabase,
-                indexingErrors: this.smartStats.indexingErrors,
-                totalCrawledUrls: siteStats ? siteStats.totalCrawledUrls : 'unknown',
-                cacheSize: siteStats ? siteStats.cacheSize : 'unknown'
-            },
-            optimization: {
-                existingUrlsInDb: this.smartStats.existingUrlsInDb || 0,
-                totalUrlsForSite: this.smartStats.totalUrlsForSite || 0,
-                resourceOptimization: `Found ${this.smartStats.existingUrlsInDb || 0} existing URLs, crawled ${this.smartStats.newUrlsFound || 0} new URLs`
-            }
-        });
-    }
-    
-    /**
-     * Get smart crawling statistics
-     */
-    getSmartStats() {
-        return {
-            ...this.smartStats,
-            siteStats: this.siteAwareDuplicateChecker ? this.siteAwareDuplicateChecker.getSiteStats(this.smartStats.siteId) : null,
-            globalStats: this.siteAwareDuplicateChecker ? this.siteAwareDuplicateChecker.getGlobalStats() : null,
-            indexingSuccess: this.smartStats.indexedToDatabase,
-            indexingFailures: this.smartStats.indexingErrors
-        };
-    }
-    
-    /**
-     * Extract internal links from parsed data - Enhanced version with smart filtering
-     */
-    async extractInternalLinks(parsedData, baseUrl) {
-        const internalLinks = [];
-        
-        try {
-            const baseUrlObj = new URL(baseUrl);
-            const baseDomain = baseUrlObj.hostname;
-            const linkSet = new Set(); // Prevent duplicates
-            
-            logger.debug('Extracting crawlable internal links', { baseUrl: baseUrl, baseDomain });
-            
-            // Extract links from various sources in parsed data
-            if (parsedData.links && Array.isArray(parsedData.links)) {
-                for (const linkObj of parsedData.links) {
-                    try {
-                        let linkUrl = linkObj.url || linkObj.href || linkObj;
-                        
-                        // Skip empty or invalid links
-                        if (!linkUrl || typeof linkUrl !== 'string') continue;
-                        
-                        // Convert relative URLs to absolute
-                        if (linkUrl.startsWith('/')) {
-                            linkUrl = `${baseUrlObj.protocol}//${baseUrlObj.host}${linkUrl}`;
-                        } else if (linkUrl.startsWith('./') || (!linkUrl.includes('://') && !linkUrl.startsWith('#'))) {
-                            try {
-                                linkUrl = new URL(linkUrl, baseUrl).href;
-                            } catch (relativeError) {
-                                continue; // Skip malformed relative URLs
-                            }
-                        }
-                        
-                        // Skip anchor links and javascript
-                        if (linkUrl.startsWith('#') || linkUrl.startsWith('javascript:') || linkUrl.startsWith('mailto:')) {
-                            continue;
-                        }
-                        
-                        // Parse the link URL
-                        const linkUrlObj = new URL(linkUrl);
-                        
-                        // Only include internal links (same domain or subdomain)
-                        const isInternal = (
-                            linkUrlObj.hostname === baseDomain || 
-                            linkUrlObj.hostname === `www.${baseDomain}` || 
-                            baseDomain === `www.${linkUrlObj.hostname}` ||
-                            linkUrlObj.hostname.endsWith(`.${baseDomain}`)
+            if (ContentTypeHandler.isDocument(contentType, uri)) {
+                const documentHandler = new DocumentHandler(this.siteId, null, uri);
+                if (contentType.includes('pdf') && Buffer.isBuffer(body)) {
+                    const pdfData = await documentHandler.processPdfContent(body, uri);
+                    const normUri = UrlValidator.normalizeUrl(uri);
+                    const siteData = await this.dataHandler.saveOrUpdateSiteData(normUri, {
+                        title: pdfData.title,
+                        description: '',
+                        keywords: '',
+                        author: pdfData.author,
+                        generator: '',
+                        h1: '', h2: '', h3: '', h4: '',
+                        article: (pdfData.content || '').substring(0, 2096000),
+                        icon: ''
+                    }, 'document');
+                    if (siteData && siteData.site_data_id) {
+                        const docWithId = new DocumentHandler(this.siteId, siteData.site_data_id, uri);
+                        await docWithId.saveDocument(
+                            uri,
+                            pdfData.title,
+                            'PDF',
+                            (pdfData.content || '').substring(0, 500),
+                            pdfData.content || ''
                         );
-                        
-                        if (isInternal && !this.shouldSkipUrl(linkUrl) && !linkSet.has(linkUrl)) {
-                            linkSet.add(linkUrl);
-                            internalLinks.push(linkUrl);
-                        }
-                    } catch (linkError) {
-                        logger.debug('Error processing individual link', { 
-                            link: linkObj, 
-                            error: linkError.message 
-                        });
-                        continue;
+                        await this.dataHandler.updateStatus(normUri, 'indexed');
                     }
                 }
             }
-            
-            // Limit the number of links to prevent overwhelming the crawler
-            const maxLinksPerPage = this.options.maxLinksPerPage || 500;
-            const limitedLinks = internalLinks.slice(0, maxLinksPerPage);
-            
-            logger.debug('Crawlable links extracted', { 
-                baseUrl: baseUrl,
-                totalLinks: parsedData.links ? parsedData.links.length : 0,
-                crawlableLinks: limitedLinks.length
-            });
-            
-            // If smart crawling is available, filter links immediately
-            if (this.siteAwareDuplicateChecker && this.smartStats.siteId) {
-                const filteredLinks = await this.addLinksToQueueSmart(limitedLinks, this.smartStats.siteId);
-                return filteredLinks;
-            }
-            
-            return limitedLinks;
         } catch (error) {
-            logger.error('Error extracting internal links', { baseUrl, error: error.message });
-            return [];
-        }
-    }
-
-    /**
-     * Detect CAPTCHA challenges in HTML content
-     * @param {string} html - The HTML content to check
-     * @param {string} url - The URL being crawled
-     * @returns {boolean} - True if CAPTCHA challenge is detected
-     */
-    isCaptchaChallenge(html, url) {
-        try {
-            // Common CAPTCHA indicators
-            const captchaPatterns = [
-                /what code is in the image/i,
-                /captcha/i,
-                /prove you are human/i,
-                /automated spam submission/i,
-                /support id.*\d{19}/i,  // RBI support ID pattern
-                /data:;base64,iVBORw0KGgo=/i,  // RBI CAPTCHA image pattern
-                /audio is not supported in your browser/i,
-                /testing whether you are a human visitor/i
-            ];
-
-            // Check if any CAPTCHA pattern matches
-            const hasCaptchaPattern = captchaPatterns.some(pattern => pattern.test(html));
-            
-            if (hasCaptchaPattern) {
-                logger.debug('CAPTCHA challenge detected', { 
-                    url, 
-                    patterns: captchaPatterns.filter(pattern => pattern.test(html)).map(p => p.source)
-                });
-                return true;
-            }
-
-            // Additional check: if content is very short and contains suspicious elements
-            if (html.length < 1000 && (
-                html.includes('support ID') || 
-                html.includes('What code is in the image') ||
-                html.includes('data:;base64,iVBORw0KGgo=')
-            )) {
-                logger.debug('Short content with CAPTCHA indicators detected', { url, contentLength: html.length });
-                return true;
-            }
-
-            return false;
-        } catch (error) {
-            logger.error('Error detecting CAPTCHA challenge', { url, error: error.message });
-            return false; // Default to not blocking on error
-        }
-    }
-
-    /**
-     * Check if a site is known to have CAPTCHA protection
-     * @param {string} url - The URL to check
-     * @returns {boolean} - True if site is known to have CAPTCHA protection
-     */
-    isCaptchaProtectedSite(url) {
-        try {
-            const urlObj = new URL(url);
-            const hostname = urlObj.hostname.toLowerCase();
-            
-            // Known CAPTCHA-protected sites
-            const captchaProtectedSites = [
-                'rbi.org.in',
-                'gov.in',
-                'nic.in'
-            ];
-            
-            return captchaProtectedSites.some(site => hostname.includes(site));
-        } catch (error) {
-            logger.error('Error checking CAPTCHA protected site', { url, error: error.message });
-            return false;
-        }
-    }
-
-    /**
-     * Perform crawl with a different user agent to bypass CAPTCHA
-     * @param {string} url - The URL to crawl
-     * @returns {Promise} - The crawl result
-     */
-    async performCrawlWithDifferentUserAgent(url) {
-        try {
-            // Store original user agent
-            const originalUserAgent = this.userAgent;
-            
-            // Use a different user agent that looks more like a real browser
-            const alternativeUserAgents = [
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            ];
-            
-            // Select a random alternative user agent
-            this.userAgent = alternativeUserAgents[Math.floor(Math.random() * alternativeUserAgents.length)];
-            
-            logger.debug('Retrying with different user agent', { 
-                url, 
-                originalUserAgent, 
-                newUserAgent: this.userAgent 
-            });
-            
-            // Perform crawl with new user agent
-            const result = await this.performCrawl(url);
-            
-            // Restore original user agent
-            this.userAgent = originalUserAgent;
-            
-            return result;
-        } catch (error) {
-            logger.error('Error in performCrawlWithDifferentUserAgent', { url, error: error.message });
-            // Restore original user agent on error
-            this.userAgent = originalUserAgent;
-            return null;
+            logger.error(`Error handling non-HTML content: ${error.message}`);
         }
     }
 }
 
-module.exports = { CrawlerCore }; 
+module.exports = { Crawler: Crawler };

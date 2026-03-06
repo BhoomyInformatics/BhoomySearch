@@ -6,6 +6,8 @@ import ImagesPage from './pages/ImagesPage';
 import VideosPage from './pages/VideosPage';
 import NewsPage from './pages/NewsPage';
 import AdminPage from './pages/AdminPage';
+import LoginPage from './pages/LoginPage';
+import SignUpPage from './pages/SignUpPage';
 
 function App() {
   return (
@@ -20,6 +22,8 @@ function App() {
           <Route path="/web" element={<SearchPage />} />
           <Route path="/admin" element={<AdminPage />} />
           <Route path="/administrator" element={<AdminPage />} />
+          <Route path="/login" element={<LoginPage />} />
+          <Route path="/signup" element={<SignUpPage />} />
         </Routes>
       </main>
       

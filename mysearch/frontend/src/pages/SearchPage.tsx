@@ -14,9 +14,13 @@ import ErrorDisplay from '../components/error/ErrorDisplay';
 import SearchFilters from '../components/optimized/SearchFilters';
 import SearchResults from '../components/optimized/SearchResults';
 import Analytics from '../components/Analytics';
+// RELEVANT TOPICS TEMPORARILY DISABLED - Not needed at this time
+// import RelevantTopics from '../components/search/RelevantTopics';
+import RelatedTiles from '../components/search/RelatedTiles';
 import { useSearchStore } from '../store/searchStore';
 import { useErrorHandler } from '../hooks/useErrorHandler';
 import { enhancedApiClient } from '../utils/enhancedApiClient';
+import { mockSearchAPI } from '../utils/mockApi';
 import { useComponentMemoryMonitor } from '../hooks/useComponentMemoryMonitor';
 import { trackUserInteraction, trackAPICall } from '../utils/errorMonitoring';
 import { handleError } from '../utils/errorHandler';
@@ -25,12 +29,11 @@ import { SearchResult, SearchFilters as SearchFiltersType } from '../types';
 // Search info component (memoized)
 const SearchInfo = memo<{
   query: string;
-  total: number;
   loading: boolean;
   searchStartTime: number | null;
   onToggleFilters: () => void;
   activeFilterCount: number;
-}>(({ query, total, loading, searchStartTime, onToggleFilters, activeFilterCount }) => {
+}>(({ query, loading, searchStartTime, onToggleFilters, activeFilterCount }) => {
   const getSeconds = useCallback(() => {
     if (!searchStartTime) return '0.000';
     return ((Date.now() - searchStartTime) / 1000).toFixed(3);
@@ -40,39 +43,39 @@ const SearchInfo = memo<{
     <motion.div
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
-      className="mb-8 search-info-section"
-      style={{ paddingLeft: '25px', paddingRight: '25px' }}
+      className="mb-4 sm:mb-6 search-info-section"
+      style={{ paddingLeft: '15px', paddingRight: '15px' }}
     >
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-3">
-          <Search className="w-6 h-6 text-blue-600" />
-          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-2">
+          <Search className="w-4 h-4 sm:w-5 sm:h-5 text-blue-600" />
+          <h1 className="text-base sm:text-lg md:text-xl font-semibold text-gray-900 dark:text-white">
             Search Results for "{query}"
           </h1>
         </div>
-        <div className="flex gap-2">
-          <button
-            onClick={onToggleFilters}
-            className="flex items-center gap-2 px-4 py-2 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors duration-300"
-          >
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z" />
-            </svg>
-            Filters
-            {activeFilterCount > 0 && (
-              <span className="bg-blue-600 text-white text-xs rounded-full px-2 py-1 min-w-[20px] text-center">
-                {activeFilterCount}
-              </span>
-            )}
-          </button>
-        </div>
+        {/* Filters Button - DISABLED - Will be implemented in future */}
+        {false && (
+          <div className="flex gap-2">
+            <button
+              onClick={onToggleFilters}
+              className="flex items-center gap-2 px-4 py-2 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors duration-300"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z" />
+              </svg>
+              Filters
+              {activeFilterCount > 0 && (
+                <span className="bg-blue-600 text-white text-xs rounded-full px-2 py-1 min-w-[20px] text-center">
+                  {activeFilterCount}
+                </span>
+              )}
+            </button>
+          </div>
+        )}
       </div>
       
       <>
-        <p className="text-gray-600 dark:text-gray-400">
-          Found {total.toLocaleString()} results
-        </p>
-        <div className="small" style={{ fontSize: '12px', color: '#666', marginTop: '5px', minHeight: '18px' }}>
+        <div className="small" style={{ fontSize: '11px', color: '#666', marginTop: '2px', minHeight: '16px' }}>
           {loading ? 'Loading more results…' : `Request time (Page generated in ${getSeconds()} seconds.)`}
         </div>
       </>
@@ -132,7 +135,9 @@ const SearchPage: React.FC = () => {
   const [searchParams] = useSearchParams();
   const query = searchParams.get('q') || '';
   const [searchStartTime, setSearchStartTime] = useState<number | null>(null);
-  const [showFilters, setShowFilters] = useState(false);
+  // FILTERS DISABLED - Will be implemented in future
+  // const [showFilters, setShowFilters] = useState(false);
+  const showFilters = false; // Always false - filters disabled
   const [localError, setLocalError] = useState<any>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   
@@ -204,6 +209,7 @@ const SearchPage: React.FC = () => {
     loading,
     error: storeError,
     filters,
+    query: storeQuery,
     setQuery,
     setResults,
     setLoading,
@@ -213,19 +219,35 @@ const SearchPage: React.FC = () => {
     addToHistory
   } = useSearchStore();
   
+  // Only show results if they match the current query from URL
+  const displayResults = useMemo(() => {
+    if (query && storeQuery && query.toLowerCase().trim() !== storeQuery.toLowerCase().trim()) {
+      // Query mismatch - return empty results
+      return [];
+    }
+    return results;
+  }, [query, storeQuery, results]);
+  
   // Add abort controller ref for current search
   const currentSearchController = useRef<AbortController | null>(null);
   const prefetchCacheRef = useRef<{ page: number; results: SearchResult[]; total: number } | null>(null);
   const prefetchingPageRef = useRef<number | null>(null);
   const loadMoreTriggerRef = useRef<HTMLDivElement | null>(null);
   const lastScrollYRef = useRef<number>(0);
+  // Track in-flight requests to prevent duplicates
+  const inFlightRequestsRef = useRef<Set<string>>(new Set());
 
-  // Memoized computed values
-  const hasResults = useMemo(() => results.length > 0, [results.length]);
-  const hasMore = useMemo(() => hasResults && results.length < total, [hasResults, results.length, total]);
+  // Memoized computed values - use displayResults to ensure query match
+  const hasResults = useMemo(() => displayResults.length > 0, [displayResults.length]);
+  const hasMore = useMemo(() => {
+    if (!query || !storeQuery || query.toLowerCase().trim() !== storeQuery.toLowerCase().trim()) {
+      return false;
+    }
+    return hasResults && displayResults.length < total;
+  }, [hasResults, displayResults.length, total, query, storeQuery]);
   const shouldShowEmptyState = useMemo(() => 
-    !loading && results.length === 0 && query && !storeError && !localError, 
-    [loading, results.length, query, storeError, localError]
+    !loading && displayResults.length === 0 && query && !storeError && !localError, 
+    [loading, displayResults.length, query, storeError, localError]
   );
 
   // Memoized error display
@@ -250,6 +272,8 @@ const SearchPage: React.FC = () => {
   // Enhanced useEffect with proper cleanup for query changes
   useEffect(() => {
     if (!query) {
+      // Clear results if no query
+      setResults([], 0);
       return;
     }
 
@@ -268,6 +292,16 @@ const SearchPage: React.FC = () => {
 
     // Only proceed if component is still mounted
     if (isMounted()) {
+      // Immediately clear old results and set loading state BEFORE setting query
+      // This ensures old results don't flash on screen
+      setResults([], 0);
+      setLoading(true);
+      setError(null);
+      setLocalError(null);
+      clearEnhancedError();
+      setCurrentPage(1);
+      
+      // Set query and add to history
       setQuery(query);
       addToHistory(query);
       
@@ -336,6 +370,18 @@ const SearchPage: React.FC = () => {
       return;
     }
 
+    // Create request key for deduplication
+    const requestKey = `${searchQuery.trim().toLowerCase()}-${page}`;
+    
+    // Check if this request is already in flight
+    if (inFlightRequestsRef.current.has(requestKey)) {
+      console.log('🚫 Search cancelled: duplicate request already in flight:', requestKey);
+      return;
+    }
+
+    // Mark request as in flight
+    inFlightRequestsRef.current.add(requestKey);
+
     console.log('🔍 SearchPage: Starting enhanced search with abort controller:', { 
       searchQuery, 
       page,
@@ -347,6 +393,9 @@ const SearchPage: React.FC = () => {
     const effectName = `search-${searchQuery}-${page}-${Date.now()}`;
     
     registerEffect(effectName);
+    
+    // Store requestKey for cleanup
+    const requestKeyToCleanup = requestKey;
     
     try {
       if (page === 1) {
@@ -374,44 +423,35 @@ const SearchPage: React.FC = () => {
           finalFilters: searchFilters
         });
         
-        // Build filters object, only including meaningful values
+        // FILTERS DISABLED - Will be implemented in future
+        // All filter logic is disabled - always send empty filters
         const apiFilters: any = {};
         
-        // Only add filters that have meaningful values
-        if (searchFilters.category && searchFilters.category !== '') {
-          apiFilters.category = searchFilters.category;
-        }
-        if (searchFilters.language && searchFilters.language !== '') {
-          apiFilters.language = searchFilters.language;
-        }
-        if (searchFilters.country && searchFilters.country !== '') {
-          apiFilters.country = searchFilters.country;
-        }
-        if (searchFilters.content_type) {
-          apiFilters.content_type = searchFilters.content_type;
-        }
-        if (searchFilters.sort_by) {
-          apiFilters.sort_by = searchFilters.sort_by;
-        }
+        console.log('🔍 SearchPage: Filters disabled - using empty filters');
         
-        // Add date range if present
-        if (searchFilters.date_range) {
-          apiFilters.date_range = searchFilters.date_range;
+        const isDev = Boolean((import.meta as any)?.env?.DEV) || process.env.NODE_ENV === 'development';
+        const useMockApi =
+          isDev &&
+          (
+            (import.meta as any)?.env?.VITE_USE_MOCK_API === 'true' ||
+            (import.meta as any)?.env?.VITE_DEMO_MODE === 'true'
+          );
+
+        if (useMockApi) {
+          return await mockSearchAPI(searchQuery, page);
         }
-        
-        console.log('🔍 SearchPage: Final API filters:', apiFilters);
-        
+
         return await enhancedApiClient.search({
-        q: searchQuery,
-        page,
-        per_page: 20,
-        filters: apiFilters
-      }, {
-        signal: controller?.signal,
-        timeout: 30000,
+          q: searchQuery,
+          page,
+          per_page: 20,
+          filters: apiFilters
+        }, {
+          signal: controller?.signal,
+          timeout: 30000,
           retryCount: 0, // We handle retries ourselves
-        retryDelay: 1000
-      });
+          retryDelay: 1000
+        });
       }, { maxAttempts: 2, baseDelay: 1000 });
 
       const searchDuration = Date.now() - currentSearchStartTime;
@@ -470,34 +510,44 @@ const SearchPage: React.FC = () => {
           setCurrentPage(page);
         }
 
-        // Prefetch next page in background if more results exist
+        // Prefetch next page in background if more results exist (only for page 1 to avoid excessive requests)
         const totalSoFar = (page === 1 ? newResults.length : results.length + newResults.length);
         const hasNext = totalSoFar < resultTotal;
-        if (hasNext && isMounted()) {
+        if (hasNext && isMounted() && page === 1) {
           try {
             const nextPage = page + 1;
-            if (prefetchingPageRef.current === nextPage) {
-              // already prefetching
-            } else {
+            const prefetchKey = `${searchQuery.trim().toLowerCase()}-${nextPage}`;
+            
+            // Only prefetch if not already in flight and not already cached
+            if (!inFlightRequestsRef.current.has(prefetchKey) && 
+                (!prefetchCacheRef.current || prefetchCacheRef.current.page !== nextPage)) {
               prefetchingPageRef.current = nextPage;
+              inFlightRequestsRef.current.add(prefetchKey);
               const bgController = new AbortController();
+              
               enhancedApiClient.search({
-              q: searchQuery,
-              page: nextPage,
-              per_page: 20,
-              filters: customFilters || filters
-            }, { signal: bgController.signal, timeout: 20000, retryCount: 0 })
-            .then((prefetchResp) => {
-              if (prefetchResp.success) {
-                prefetchCacheRef.current = {
-                  page: nextPage,
-                  results: prefetchResp.data?.results || [],
-                  total: prefetchResp.data?.total || resultTotal
-                };
-                console.log('⚡ Prefetched page', nextPage, 'count:', prefetchCacheRef.current.results.length);
-              }
-            })
-            .catch(() => {/* ignore prefetch errors */});
+                q: searchQuery,
+                page: nextPage,
+                per_page: 20,
+                filters: customFilters || filters
+              }, { signal: bgController.signal, timeout: 20000, retryCount: 0 })
+              .then((prefetchResp) => {
+                if (prefetchResp.success && isMounted()) {
+                  prefetchCacheRef.current = {
+                    page: nextPage,
+                    results: prefetchResp.data?.results || [],
+                    total: prefetchResp.data?.total || resultTotal
+                  };
+                  console.log('⚡ Prefetched page', nextPage, 'count:', prefetchCacheRef.current.results.length);
+                }
+              })
+              .catch(() => {/* ignore prefetch errors */})
+              .finally(() => {
+                inFlightRequestsRef.current.delete(prefetchKey);
+                if (prefetchingPageRef.current === nextPage) {
+                  prefetchingPageRef.current = null;
+                }
+              });
             }
           } catch {/* ignore */}
         }
@@ -583,6 +633,11 @@ const SearchPage: React.FC = () => {
     } finally {
       unregisterEffect(effectName);
       
+      // Remove from in-flight requests
+      if (requestKeyToCleanup) {
+        inFlightRequestsRef.current.delete(requestKeyToCleanup);
+      }
+      
       // Only update loading state if component is still mounted
       if (isMounted() && page === 1) {
         setLoading(false);
@@ -598,7 +653,14 @@ const SearchPage: React.FC = () => {
   }, [performSearchWithController]);
 
   // Enhanced filter change with abort controller support and retry logic
-  const handleFilterChange = useCallback((newFilters: Partial<SearchFiltersType>) => {
+  // FILTERS DISABLED - Will be implemented in future
+  const handleFilterChange = useCallback((_newFilters: Partial<SearchFiltersType>) => {
+    // Filters are disabled - do nothing
+    console.log('🚫 Filter change ignored - filters are disabled');
+    return;
+    
+    // DISABLED CODE - Will be implemented in future
+    /*
     if (!isMounted()) {
       console.log('🚫 Filter change ignored: component unmounted');
       return;
@@ -646,12 +708,18 @@ const SearchPage: React.FC = () => {
           }
         });
     }
-  }, [isMounted, query, filters, setFilters, performSearchWithController, executeWithRetry]);
+    */
+  }, []);
 
   // Enhanced load more with abort controller support and retry logic
   const loadMore = useCallback(() => {
     if (!isMounted()) {
       console.log('🚫 Load more ignored: component unmounted');
+      return;
+    }
+
+    // Only load more if query matches store query
+    if (!query || !storeQuery || query.toLowerCase().trim() !== storeQuery.toLowerCase().trim()) {
       return;
     }
 
@@ -711,11 +779,19 @@ const SearchPage: React.FC = () => {
   }, [isMounted, loading, query, hasResults, currentPage, results.length, performSearchWithController, executeWithRetry]);
 
   // Toggle filters with tracking
+  // FILTERS DISABLED - Will be implemented in future
   const toggleFilters = useCallback(() => {
+    // Filters are disabled - do nothing
+    console.log('🚫 Filter toggle ignored - filters are disabled');
+    return;
+    
+    // DISABLED CODE - Will be implemented in future
+    /*
     const newShowFilters = !showFilters;
     setShowFilters(newShowFilters);
     trackUserInteraction('filters_toggled', { visible: newShowFilters });
-  }, [showFilters]);
+    */
+  }, []);
 
 
   // Handle result clicks with tracking
@@ -775,26 +851,26 @@ const SearchPage: React.FC = () => {
     };
   }, [addCleanupFunction]);
 
-  // Prefetch-on-viewport using IntersectionObserver
-  useEffect(() => {
-    if (!hasMore) return;
-    const el = loadMoreTriggerRef.current;
-    if (!el) return;
-    const observer = new IntersectionObserver((entries) => {
-      entries.forEach((entry) => {
-        if (entry.isIntersecting) {
-          // Start prefetch for the next page if not already available
-          if (!prefetchCacheRef.current || prefetchCacheRef.current.page !== currentPage + 1) {
-            const controller = new AbortController();
-            performSearchWithController(query, currentPage + 1, controller)
-              .catch(() => {/* ignore */});
-          }
-        }
-      });
-    }, { root: null, rootMargin: '600px 0px 600px 0px', threshold: 0 });
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [hasMore, currentPage, query, performSearchWithController]);
+  // Prefetch-on-viewport using IntersectionObserver (DISABLED - too aggressive, causing duplicate requests)
+  // useEffect(() => {
+  //   if (!hasMore) return;
+  //   const el = loadMoreTriggerRef.current;
+  //   if (!el) return;
+  //   const observer = new IntersectionObserver((entries) => {
+  //     entries.forEach((entry) => {
+  //       if (entry.isIntersecting) {
+  //         // Start prefetch for the next page if not already available
+  //         if (!prefetchCacheRef.current || prefetchCacheRef.current.page !== currentPage + 1) {
+  //           const controller = new AbortController();
+  //           performSearchWithController(query, currentPage + 1, controller)
+  //             .catch(() => {/* ignore */});
+  //         }
+  //       }
+  //     });
+  //   }, { root: null, rootMargin: '600px 0px 600px 0px', threshold: 0 });
+  //   observer.observe(el);
+  //   return () => observer.disconnect();
+  // }, [hasMore, currentPage, query, performSearchWithController]);
 
   return (
     <ErrorBoundary
@@ -825,7 +901,6 @@ const SearchPage: React.FC = () => {
             {/* Search Info */}
             <SearchInfo
               query={query}
-              total={total}
               loading={loading}
               searchStartTime={searchStartTime}
               onToggleFilters={toggleFilters}
@@ -833,8 +908,8 @@ const SearchPage: React.FC = () => {
             />
 
 
-            {/* Filters */}
-            {showFilters && (
+            {/* Filters - DISABLED - Will be implemented in future */}
+            {false && showFilters && (
               <SearchFilters
                 filters={filters}
                 onFiltersChange={handleFilterChange}
@@ -892,12 +967,26 @@ const SearchPage: React.FC = () => {
           </div>
         )}
 
+        {/* Relevant Topics - TEMPORARILY DISABLED - Not needed at this time */}
+        {/* 
+        {!loading && displayResults.length > 0 && (
+          <RelevantTopics query={query} results={displayResults} />
+        )}
+        */}
+
         {/* Search Results */}
             <SearchResults
-              results={results}
+              results={displayResults}
               loading={loading || loadingMore}
               onResultClick={handleResultClick}
+              query={query}
+              total={query && storeQuery && query.toLowerCase().trim() === storeQuery.toLowerCase().trim() ? total : 0}
             />
+
+        {/* Related Tiles - Show after results */}
+            {!loading && displayResults.length > 0 && (
+              <RelatedTiles query={query} results={displayResults} />
+            )}
 
         {/* Load More Button */}
             {hasMore && (

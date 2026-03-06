@@ -155,11 +155,16 @@ const LazySearchResults: React.FC<LazySearchResultsProps> = memo(({
                 <span className="truncate max-w-xs">
                   {result.site_data_link || '#'}
                 </span>
-                {result.site_data_date && (
-                  <span>
-                    {new Date(result.site_data_date).toLocaleDateString()}
-                  </span>
-                )}
+                {result.site_data_date && (() => {
+                  try {
+                    const date = new Date(result.site_data_date);
+                    return isNaN(date.getTime()) ? null : (
+                      <span>{date.toLocaleDateString()}</span>
+                    );
+                  } catch {
+                    return null;
+                  }
+                })()}
                 {result.site_title && (
                   <span className="text-gray-400">
                     {result.site_title}

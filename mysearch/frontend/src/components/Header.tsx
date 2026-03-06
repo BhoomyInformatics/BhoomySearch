@@ -4,8 +4,10 @@
 
 import React, { useState, useRef, useEffect } from 'react';
 import { useNavigate, useSearchParams, Link, useLocation } from 'react-router-dom';
-import { Search } from 'lucide-react';
+import { Search, Mic } from 'lucide-react';
 import { useAccessibility } from '../hooks/useAccessibility';
+// USER LOGIN ACCESS TEMPORARILY DISABLED - All users can access all data
+// import { useAuthStore } from '../store/authStore';
 
 interface NavigationItem {
   name: string;
@@ -23,8 +25,32 @@ const Header: React.FC = () => {
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [activeNavItem, setActiveNavItem] = useState('');
+  const [showUserMenu, setShowUserMenu] = useState(false);
+  const [isListening, setIsListening] = useState(false);
   
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const userMenuRef = useRef<HTMLDivElement>(null);
+  const recognitionRef = useRef<any>(null);
+  const voiceSearchProcessedRef = useRef<boolean>(false);
+  // USER LOGIN ACCESS TEMPORARILY DISABLED - All users can access all data
+  // const { user, isAuthenticated, logout } = useAuthStore();
+
+  // Close user menu when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (userMenuRef.current && !userMenuRef.current.contains(event.target as Node)) {
+        setShowUserMenu(false);
+      }
+    };
+
+    if (showUserMenu) {
+      document.addEventListener('mousedown', handleClickOutside);
+    }
+
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [showUserMenu]);
 
   // Accessibility hooks
   const {
@@ -40,7 +66,7 @@ const Header: React.FC = () => {
   // Navigation items with accessibility labels
   const navigationItems: NavigationItem[] = [
     {
-      name: 'Web',
+      name: 'All',
       path: '/search',
       ariaLabel: 'Search web pages'
     },
@@ -107,10 +133,43 @@ const Header: React.FC = () => {
   // Handle search submission
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
-    if (query.trim()) {
-      const searchQuery = query.trim();
+    
+    // Prevent search if voice recognition just finished (give user time to review)
+    if (voiceSearchProcessedRef.current) {
+      // Clear the flag to allow search after user explicitly clicks
+      voiceSearchProcessedRef.current = false;
+    }
+    
+    // Stop voice recognition if still listening
+    if (isListening && recognitionRef.current) {
+      recognitionRef.current.stop();
+      setIsListening(false);
+      // Don't search immediately after stopping voice - let user review the text
+      return;
+    }
+    
+    // Get query from input field (in case voice search updated it directly)
+    const searchQuery = (searchInputRef.current?.value || query).trim();
+    
+    if (searchQuery) {
+      // Update state to match input
+      setQuery(searchQuery);
+      
       announce(`Searching for: ${searchQuery}`, 'assertive');
-      navigate(`/search?q=${encodeURIComponent(searchQuery)}`);
+      
+      // Preserve current page type (news, images, videos) when searching
+      const currentPath = location.pathname;
+      let targetPath = '/search'; // Default to web search
+      
+      if (currentPath === '/news' || currentPath.startsWith('/news')) {
+        targetPath = '/news';
+      } else if (currentPath === '/images' || currentPath.startsWith('/images')) {
+        targetPath = '/images';
+      } else if (currentPath === '/videos' || currentPath.startsWith('/videos')) {
+        targetPath = '/videos';
+      }
+      
+      navigate(`${targetPath}?q=${encodeURIComponent(searchQuery)}`);
       setShowSuggestions(false);
     } else {
       announce('Please enter a search query', 'assertive');
@@ -163,22 +222,163 @@ const Header: React.FC = () => {
     setShowSuggestions(false);
     announce(`Selected suggestion: ${suggestion}`);
     
-    // Auto-navigate to search
+    // Auto-navigate to search, preserving current page type
     setTimeout(() => {
-      navigate(`/search?q=${encodeURIComponent(suggestion)}`);
+      const currentPath = location.pathname;
+      let targetPath = '/search'; // Default to web search
+      
+      if (currentPath === '/news' || currentPath.startsWith('/news')) {
+        targetPath = '/news';
+      } else if (currentPath === '/images' || currentPath.startsWith('/images')) {
+        targetPath = '/images';
+      } else if (currentPath === '/videos' || currentPath.startsWith('/videos')) {
+        targetPath = '/videos';
+      }
+      
+      navigate(`${targetPath}?q=${encodeURIComponent(suggestion)}`);
     }, 100);
   };
+
+  // Voice search functionality
+  const startVoiceSearch = () => {
+    // Check if browser supports speech recognition
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    
+    if (!SpeechRecognition) {
+      announce('Voice search is not supported in your browser. Please use Chrome or Edge.');
+      return;
+    }
+
+    // Stop any existing recognition
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+    }
+
+    // Reset the processed flag
+    voiceSearchProcessedRef.current = false;
+
+    // Create new recognition instance
+    const recognition = new SpeechRecognition();
+    recognition.continuous = true; // Allow continuous speech
+    recognition.interimResults = true; // Get interim results as user speaks
+    recognition.lang = 'en-US';
+
+    recognition.onstart = () => {
+      setIsListening(true);
+      voiceSearchProcessedRef.current = false;
+      announce('Listening... Speak your search query');
+    };
+
+    recognition.onresult = (event: any) => {
+      let interimTranscript = '';
+      let finalTranscript = '';
+
+      // Process all results
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const transcript = event.results[i][0].transcript;
+        if (event.results[i].isFinal) {
+          finalTranscript += transcript + ' ';
+        } else {
+          interimTranscript += transcript;
+        }
+      }
+
+      // Update input field with current transcript (interim or final)
+      const currentTranscript = finalTranscript.trim() || interimTranscript.trim();
+      if (currentTranscript && searchInputRef.current) {
+        searchInputRef.current.value = currentTranscript;
+        setQuery(currentTranscript); // Update state for visual feedback
+      }
+
+      // Only process final results (when user finishes speaking)
+      if (finalTranscript.trim() && !voiceSearchProcessedRef.current) {
+        const finalText = finalTranscript.trim();
+        
+        // Mark as processed to prevent duplicate handling
+        voiceSearchProcessedRef.current = true;
+        
+        // Stop listening but don't set isListening to false immediately
+        // This prevents accidental form submission
+        if (recognitionRef.current) {
+          recognitionRef.current.stop();
+        }
+        
+        // Use a small delay before updating listening state to prevent form submission
+        setTimeout(() => {
+          setIsListening(false);
+        }, 100);
+        
+        announce(`Heard: ${finalText}. Click search to find results.`);
+        
+        // Update input with final text
+        if (searchInputRef.current) {
+          searchInputRef.current.value = finalText;
+        }
+        setQuery(finalText);
+        
+        // Don't navigate automatically - wait for user to click search icon
+        // The user can now review the text and click search when ready
+      }
+    };
+
+    recognition.onerror = (event: any) => {
+      console.error('Speech recognition error:', event.error);
+      setIsListening(false);
+      voiceSearchProcessedRef.current = false;
+      
+      if (event.error === 'no-speech') {
+        announce('No speech detected. Please try again.');
+      } else if (event.error === 'not-allowed') {
+        announce('Microphone permission denied. Please enable microphone access.');
+      } else {
+        announce('Voice search error. Please try again.');
+      }
+    };
+
+    recognition.onend = () => {
+      // Only update listening state if we haven't already processed final results
+      // This prevents any accidental form submission
+      if (!voiceSearchProcessedRef.current) {
+        setIsListening(false);
+      }
+      // If we have a final transcript and user hasn't searched yet, keep it in the input
+      // Reset processed flag after a delay to allow for new searches
+      setTimeout(() => {
+        voiceSearchProcessedRef.current = false;
+      }, 2000); // Increased delay to ensure user has time to review
+    };
+
+    recognitionRef.current = recognition;
+    recognition.start();
+  };
+
+  const stopVoiceSearch = () => {
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      setIsListening(false);
+    }
+  };
+
+  // Cleanup recognition on unmount
+  useEffect(() => {
+    return () => {
+      if (recognitionRef.current) {
+        recognitionRef.current.stop();
+      }
+    };
+  }, []);
 
 
   return (
     <header 
       id="site-header"
-      className="site-header"
+      className="site-header bg-white"
       role="banner"
       aria-label="Site header with navigation and search"
+      style={{ borderTop: 'none' }}
     >
-      <div id="wrapper">
-        <div className="container-fluid">
+      <div id="wrapper" style={{ borderTop: 'none' }}>
+        <div className="container-fluid" style={{ borderTop: 'none' }}>
           {/* Main Header Row */}
           <div 
             className="row-header" 
@@ -192,16 +392,19 @@ const Header: React.FC = () => {
               position: 'relative'
             }}
           >
-            <div style={{ 
-              display: 'flex', 
-              alignItems: 'center', 
-              width: '100%',
-              justifyContent: 'space-between',
-              maxWidth: '1400px',
-              margin: '0 auto',
-              paddingLeft: '20px',
-              paddingRight: '20px'
-            }}>
+            <div 
+              className="header-inner-container"
+              style={{ 
+                display: 'flex', 
+                alignItems: 'center', 
+                width: '100%',
+                justifyContent: 'space-between',
+                maxWidth: '1400px',
+                margin: '0 auto',
+                paddingLeft: '20px',
+                paddingRight: '20px'
+              }}
+            >
               {/* Logo Section */}
               <div 
                 className="logo-section"
@@ -233,7 +436,6 @@ const Header: React.FC = () => {
                       display: 'block'
                     }}
                     loading="eager"
-                    fetchPriority="high"
                   />
                 </Link>
               </div>
@@ -260,7 +462,7 @@ const Header: React.FC = () => {
                   role="search"
                   aria-label="Header search form"
                 >
-                  <div className="input-group" style={{ position: 'relative' }}>
+                  <div className="input-group" style={{ position: 'relative', display: 'flex', alignItems: 'center', backgroundColor: 'white', border: '2px solid #ddd', borderRadius: '15px', boxShadow: '0 2px 8px rgba(0,0,0,0.1)', transition: 'all 0.3s ease' }}>
                     <label htmlFor="header-search-input" className="sr-only">
                       Search query
                     </label>
@@ -269,30 +471,35 @@ const Header: React.FC = () => {
                       id="header-search-input"
                       ref={searchInputRef}
                       type="search"
-                      placeholder="Search Web, Images, Videos, News..."
+                      placeholder="What are you looking for? Search with Bhoomy!"
                       name="q"
                       value={query}
                       onChange={handleInputChange}
                       className="form-control input-md"
                       style={{
-                        width: '100%',
-                        padding: '12px 50px 12px 16px',
-                        border: '2px solid #ddd',
-                        borderRadius: '15px',
+                        flex: 1,
+                        padding: '12px 12px 12px 16px',
+                        border: 'none',
+                        borderRadius: '0',
                         fontSize: '16px',
                         outline: 'none',
                         boxSizing: 'border-box',
-                        transition: 'all 0.3s ease',
-                        boxShadow: '0 2px 8px rgba(0,0,0,0.1)'
+                        backgroundColor: 'transparent'
                       }}
                       onFocus={(e) => {
-                        e.target.style.borderColor = '#fe780e';
-                        e.target.style.boxShadow = '0 3px 12px rgba(254,120,14,0.2)';
+                        const container = e.target.closest('.input-group') as HTMLElement;
+                        if (container) {
+                          container.style.borderColor = '#fe780e';
+                          container.style.boxShadow = '0 3px 12px rgba(254,120,14,0.2)';
+                        }
                         announce('Search input focused');
                       }}
                       onBlur={(e) => {
-                        e.target.style.borderColor = '#ddd';
-                        e.target.style.boxShadow = '0 2px 8px rgba(0,0,0,0.1)';
+                        const container = e.target.closest('.input-group') as HTMLElement;
+                        if (container) {
+                          container.style.borderColor = '#ddd';
+                          container.style.boxShadow = '0 2px 8px rgba(0,0,0,0.1)';
+                        }
                         setTimeout(() => setShowSuggestions(false), 200);
                       }}
                       autoComplete="off"
@@ -305,29 +512,91 @@ const Header: React.FC = () => {
                       Enter keywords to search across web, images, videos, and news. Use quotes for exact phrases.
                     </div>
                     
+                    {/* Separator Line */}
+                    <div style={{ 
+                      height: '24px', 
+                      width: '1px', 
+                      backgroundColor: '#d1d5db',
+                      margin: '0 8px'
+                    }}></div>
+                    
+                    {/* Microphone Icon */}
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        if (isListening) {
+                          stopVoiceSearch();
+                        } else {
+                          startVoiceSearch();
+                        }
+                      }}
+                      style={{
+                        backgroundColor: isListening ? 'rgba(254, 120, 14, 0.1)' : 'transparent',
+                        border: 'none',
+                        cursor: 'pointer',
+                        padding: '8px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        transition: 'all 0.3s ease',
+                        marginRight: '4px',
+                        borderRadius: '50%'
+                      }}
+                      onMouseOver={(e) => {
+                        if (!isListening) {
+                          e.currentTarget.style.color = '#ff9500';
+                        }
+                      }}
+                      onMouseOut={(e) => {
+                        if (!isListening) {
+                          e.currentTarget.style.color = '#fe780e';
+                        }
+                      }}
+                      onFocus={(e) => {
+                        e.currentTarget.style.outline = '2px solid #fe780e';
+                        e.currentTarget.style.outlineOffset = '2px';
+                      }}
+                      onBlur={(e) => {
+                        e.currentTarget.style.outline = 'none';
+                      }}
+                      aria-label={isListening ? "Stop voice search" : "Start voice search"}
+                      title={isListening ? "Stop listening" : "Voice search"}
+                    >
+                      <Mic 
+                        style={{ 
+                          width: '18px', 
+                          height: '18px', 
+                          color: isListening ? '#ff9500' : '#fe780e',
+                          animation: isListening ? 'pulse 1.5s ease-in-out infinite' : 'none'
+                        }}
+                        aria-hidden="true"
+                      />
+                    </button>
+                    
+                    {/* Search Icon on Right */}
                     <button 
                       className="btn search-submit" 
                       type="submit" 
                       style={{
-                        position: 'absolute',
-                        right: '15px',
-                        top: '50%',
-                        transform: 'translateY(-50%)',
                         backgroundColor: 'transparent',
                         border: 'none',
                         cursor: 'pointer',
-                        padding: '6px',
-                        borderRadius: '50%',
+                        padding: '12px 16px',
+                        borderRadius: '0 15px 15px 0',
                         display: 'flex',
                         alignItems: 'center',
                         justifyContent: 'center',
-                        transition: 'background-color 0.3s ease'
+                        transition: 'color 0.3s ease',
+                        color: '#fe780e',
+                        marginRight: '4px'
                       }}
                       onMouseOver={(e) => {
-                        e.currentTarget.style.backgroundColor = 'rgba(254,120,14,0.1)';
+                        e.currentTarget.style.color = '#ff9500';
                       }}
                       onMouseOut={(e) => {
-                        e.currentTarget.style.backgroundColor = 'transparent';
+                        e.currentTarget.style.color = '#fe780e';
                       }}
                       onFocus={(e) => {
                         e.currentTarget.style.outline = '2px solid #fe780e';
@@ -342,8 +611,7 @@ const Header: React.FC = () => {
                       <Search 
                         style={{ 
                           width: '20px', 
-                          height: '20px', 
-                          color: '#fe780e' 
+                          height: '20px'
                         }}
                         aria-hidden="true"
                       />
@@ -363,7 +631,7 @@ const Header: React.FC = () => {
                         border: '1px solid #ddd',
                         borderTop: 'none',
                         borderRadius: '0 0 15px 15px',
-                        boxShadow: '0 4px 15px rgba(0,0,0,0.1)',
+                        boxShadow: '0 4px 15px #f75d10',
                         zIndex: 1000,
                         maxHeight: '200px',
                         overflowY: 'auto'
@@ -407,15 +675,102 @@ const Header: React.FC = () => {
                 </form>
               </div>
 
-              {/* Secondary Logo */}
+              {/* Secondary Logo / User Info */}
               <div 
                 className="secondary-logo"
                 style={{ 
                   flex: '0 0 auto',
                   display: 'flex',
-                  alignItems: 'center'
+                  alignItems: 'center',
+                  gap: '12px'
                 }}
               >
+                {/* USER LOGIN ACCESS TEMPORARILY DISABLED - All users can access all data */}
+                {/* 
+                {isAuthenticated && user ? (
+                  <div className="relative" style={{ position: 'relative' }} ref={userMenuRef}>
+                    <button
+                      onClick={() => setShowUserMenu(!showUserMenu)}
+                      className="flex items-center gap-2 px-2 sm:px-3 py-2 bg-blue-50 dark:bg-gray-700 rounded-lg hover:bg-blue-100 dark:hover:bg-gray-600 transition-colors"
+                      style={{
+                        border: '1px solid #e5e7eb',
+                        cursor: 'pointer'
+                      }}
+                      aria-label="User menu"
+                    >
+                      <div className="w-8 h-8 bg-blue-600 rounded-full flex items-center justify-center text-white text-sm font-semibold flex-shrink-0">
+                        <User className="w-4 h-4" />
+                      </div>
+                      <div className="hidden sm:block text-left">
+                        <div className="text-sm font-medium text-gray-900 dark:text-white truncate max-w-[120px]">
+                          {user.user_name || 'User'}
+                        </div>
+                        <div className="text-xs text-gray-500 dark:text-gray-400 truncate max-w-[120px]">
+                          {user.user_email}
+                        </div>
+                      </div>
+                    </button>
+                    
+                    {showUserMenu && (
+                      <div 
+                        className="absolute right-0 mt-2 w-48 sm:w-56 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 z-50"
+                        style={{
+                          top: '100%',
+                          right: 0
+                        }}
+                      >
+                        <div className="p-3 border-b border-gray-200 dark:border-gray-700">
+                          <div className="text-sm font-medium text-gray-900 dark:text-white">
+                            {user.user_name || 'User'}
+                          </div>
+                          <div className="text-xs text-gray-500 dark:text-gray-400 truncate">
+                            {user.user_email}
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => {
+                            setShowUserMenu(false);
+                            navigate('/profile');
+                          }}
+                          className="w-full flex items-center gap-2 px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors"
+                        >
+                          <User className="w-4 h-4" />
+                          <span>Profile</span>
+                        </button>
+                        <button
+                          onClick={() => {
+                            logout();
+                            setShowUserMenu(false);
+                            navigate('/');
+                          }}
+                          className="w-full flex items-center gap-2 px-4 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
+                        >
+                          <LogOut className="w-4 h-4" />
+                          <span>Logout</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <Link
+                      to="/login"
+                      state={{ from: { pathname: location.pathname + location.search } }}
+                      className="px-3 py-1.5 text-sm font-medium text-blue-600 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300 transition-colors"
+                    >
+                      Sign In
+                    </Link>
+                    <Link
+                      to="/signup"
+                      state={{ from: { pathname: location.pathname + location.search } }}
+                      className="px-3 py-1.5 text-sm font-medium bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+                    >
+                      Sign Up
+                    </Link>
+                  </div>
+                )}
+                */}
+                
                 <Link 
                   to="/" 
                   style={{ textDecoration: 'none' }}
@@ -427,6 +782,7 @@ const Header: React.FC = () => {
                   onBlur={(e) => {
                     e.currentTarget.style.outline = 'none';
                   }}
+                  className="hidden sm:block"
                 >
                   <img 
                     src="/images/Bhoomy.png" 
@@ -472,10 +828,10 @@ const Header: React.FC = () => {
                 style={{
                   display: 'flex',
                   listStyle: 'none',
-                  marginLeft: '10px',
+                  margin: '0',
                   fontSize: '14px',
-                  padding: '4px 0',
-                  gap: '25px',
+                  padding: '0',
+                  gap: '8px',
                   flexWrap: 'wrap',
                   justifyContent: 'flex-start'
                 }}
@@ -490,18 +846,21 @@ const Header: React.FC = () => {
                         rel="noopener noreferrer"
                         style={{
                           textDecoration: 'none',
-                          padding: '8px 0',
-                          display: 'inline-block',
-                          color: '#333',
-                          fontWeight: 'normal',
-                          borderBottom: '2px solid transparent',
-                          transition: 'all 0.3s ease'
+                          padding: '12px 16px',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '6px',
+                          color: '#5f6368',
+                          fontWeight: '500',
+                          borderBottom: '3px solid transparent',
+                          transition: 'all 0.3s ease',
+                          height: '100%'
                         }}
                         onMouseOver={(e) => {
                           e.currentTarget.style.color = '#fe780e';
                         }}
                         onMouseOut={(e) => {
-                          e.currentTarget.style.color = '#333';
+                          e.currentTarget.style.color = '#5f6368';
                         }}
                         onFocus={(e) => {
                           // Remove focus outline and underline effects
@@ -514,30 +873,38 @@ const Header: React.FC = () => {
                         aria-label={item.ariaLabel}
                         role="menuitem"
                       >
-                        <strong>{item.name}</strong>
+                        <strong style={{ fontWeight: 'inherit' }}>{item.name}</strong>
                       </a>
                     ) : (
                       <button
                         onClick={() => handleNavigation(item.path, currentQuery)}
                         style={{
                           textDecoration: 'none',
-                          padding: '8px 0',
-                          display: 'inline-block',
-                          color: activeNavItem === item.name ? '#fe780e' : '#333',
-                          fontWeight: 'normal',
-                          borderBottom: '2px solid transparent',
-                          transition: 'all 0.3s ease',
-                          background: 'transparent',
-                          border: 'none',
+                          padding: '12px 16px',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '6px',
+                          color: activeNavItem === item.name ? '#fe780e' : '#5f6368',
+                          fontWeight: activeNavItem === item.name ? '600' : '500',
+                          borderBottom: activeNavItem === item.name ? '3px solid #fe780e' : '3px solid transparent',
+                          backgroundColor: activeNavItem === item.name ? '#fff3e0' : 'transparent',
+                          transition: 'all 0.2s ease',
+                          borderTop: 'none',
+                          borderLeft: 'none',
+                          borderRight: 'none',
                           cursor: 'pointer',
-                          fontSize: '14px'
+                          fontSize: '14px',
+                          height: '100%',
+                          outline: 'none'
                         }}
                         onMouseOver={(e) => {
-                          e.currentTarget.style.color = '#fe780e';
+                          if (activeNavItem !== item.name) {
+                            e.currentTarget.style.color = '#fe780e';
+                          }
                         }}
                         onMouseOut={(e) => {
                           if (activeNavItem !== item.name) {
-                            e.currentTarget.style.color = '#333';
+                            e.currentTarget.style.color = '#5f6368';
                           }
                         }}
                         onFocus={(e) => {
@@ -552,7 +919,7 @@ const Header: React.FC = () => {
                         aria-current={activeNavItem === item.name ? 'page' : undefined}
                         role="menuitem"
                       >
-                        <strong>{item.name}</strong>
+                        <strong style={{ fontWeight: 'inherit' }}>{item.name}</strong>
                       </button>
                     )}
                   </li>
@@ -576,6 +943,18 @@ const Header: React.FC = () => {
             clip: rect(0, 0, 0, 0);
             white-space: nowrap;
             border: 0;
+          }
+
+          /* Pulse animation for voice search */
+          @keyframes pulse {
+            0%, 100% {
+              opacity: 1;
+              transform: scale(1);
+            }
+            50% {
+              opacity: 0.7;
+              transform: scale(1.1);
+            }
           }
 
           /* High contrast mode support */
@@ -621,8 +1000,8 @@ const Header: React.FC = () => {
             }
             
             .row-header img {
-              height: 65px !important;
-              max-width: 200px !important;
+              height: 45px !important;
+              max-width: 120px !important;
             }
             
             .secondary-logo {
@@ -634,11 +1013,17 @@ const Header: React.FC = () => {
             }
             
             .navbar-nav {
-              gap: 15px !important;
-              justify-content: flex-start !important;
+              gap: 8px !important;
+              justifyContent: flex-start !important;
               flex-wrap: nowrap !important;
               overflow-x: auto !important;
-              padding: 4px 0 !important;
+              padding: 0 !important;
+              margin: 0 !important;
+              -webkit-overflow-scrolling: touch;
+              scrollbar-width: none; /* Firefox */
+            }
+            .navbar-nav::-webkit-scrollbar {
+              display: none; /* Safari and Chrome */
             }
             
             .navbar-nav-container {
@@ -652,40 +1037,125 @@ const Header: React.FC = () => {
             
             .navbar-nav button,
             .navbar-nav a {
-              font-size: 12px !important;
-              padding: 4px 0 !important;
+              font-size: 13px !important;
+              padding: 10px 14px !important;
               white-space: nowrap !important;
+              height: 100% !important;
             }
             
-            .row-header > div {
-              justify-content: space-between !important;
-              gap: 15px !important;
+            .row-header > div,
+            .header-inner-container {
+              justify-content: flex-start !important;
+              gap: 8px !important;
+              flex-wrap: nowrap !important;
+              align-items: center !important;
+            }
+            
+            .logo-section {
+              flex: 0 0 auto !important;
+              min-width: 0 !important;
             }
             
             .search-section {
-              flex: 1 !important;
-              padding: 0 15px !important;
+              flex: 1 1 auto !important;
+              padding: 0 8px !important;
+              min-width: 0 !important;
+              max-width: 100% !important;
             }
             
             .search-form {
               max-width: 100% !important;
               width: 100% !important;
             }
+            
+            .input-group {
+              flex-wrap: nowrap !important;
+            }
+            
+            .input-group input {
+              font-size: 13px !important;
+              padding: 8px 6px 8px 32px !important;
+              min-width: 0 !important;
+            }
+            
+            .input-group button.search-submit {
+              padding: 8px 10px !important;
+              font-size: 11px !important;
+            }
+            
+            .input-group button[aria-label="Voice search"] {
+              padding: 6px !important;
+              margin-right: 2px !important;
+            }
+            
+            .input-group button[aria-label="Voice search"] svg {
+              width: 16px !important;
+              height: 16px !important;
+            }
+            
+            .input-group > div[style*="height: 24px"] {
+              height: 20px !important;
+              margin: 0 4px !important;
+            }
           }
           
           @media (max-width: 480px) {
             .row-header img {
-              height: 55px !important;
-              max-width: 180px !important;
+              height: 40px !important;
+              max-width: 100px !important;
             }
             
-            .form-control {
-              font-size: 14px !important;
-              padding: 10px 45px 10px 12px !important;
+            .row-header > div {
+              padding-left: 8px !important;
+              padding-right: 8px !important;
+              gap: 6px !important;
+            }
+            
+            .logo-section {
+              flex: 0 0 auto !important;
             }
             
             .search-section {
-              padding: 0 10px !important;
+              padding: 0 4px !important;
+              flex: 1 1 auto !important;
+              min-width: 0 !important;
+            }
+            
+            .input-group input {
+              font-size: 12px !important;
+              padding: 8px 4px 8px 28px !important;
+            }
+            
+            .input-group input::placeholder {
+              font-size: 10px !important;
+            }
+            
+            .input-group button.search-submit {
+              padding: 8px 8px !important;
+              font-size: 10px !important;
+            }
+            
+            .input-group > div[style*="height: 24px"] {
+              display: none !important;
+            }
+            
+            .input-group button[aria-label="Voice search"] {
+              padding: 6px 3px !important;
+              margin-right: 2px !important;
+            }
+            
+            .input-group button[aria-label="Voice search"] svg {
+              width: 14px !important;
+              height: 14px !important;
+            }
+            
+            .input-group > div[style*="left: 12px"] {
+              left: 8px !important;
+            }
+            
+            .input-group > div[style*="left: 12px"] svg {
+              width: 14px !important;
+              height: 14px !important;
             }
           }
 
