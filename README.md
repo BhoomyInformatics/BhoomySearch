@@ -1,4 +1,4 @@
-## Bhoomy Search Engine (SearchEngine Monorepo)
+## Bhoomy Search Engine
 
 This repository contains the full Bhoomy Search Engine stack:
 
